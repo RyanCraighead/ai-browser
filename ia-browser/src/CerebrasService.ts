@@ -269,7 +269,8 @@ ${content.substring(0, 60000)}`;
     content: string,
     title: string,
     pageSchema?: string,
-    domSnapshot?: any
+    domSnapshot?: any,
+    userContext?: string
   ): Promise<string> {
     const systemPrompt = `You are a helpful AI assistant answering questions about web pages.
 You MUST provide accurate, helpful responses based on the page content.
@@ -288,7 +289,9 @@ ${content.substring(0, 60000)}
 
 ${pageSchema ? `Page Schema (JSON):\n${pageSchema.substring(0, 60000)}` : ''}
 
-${domText ? `DOM Snapshot (truncated):\n${domText}` : ''}`;
+${domText ? `DOM Snapshot (truncated):\n${domText}` : ''}
+
+${userContext ? `User Context Notes:\n${userContext.substring(0, 8000)}` : ''}`;
 
     return await this.chat(message, systemPrompt);
   }
@@ -341,6 +344,80 @@ ${pageSchema.substring(0, 60000)}`;
     return await this.chat(message, systemPrompt);
   }
 
+  async planChatBrowsing(
+    userRequest: string,
+    context: {
+      currentUrl: string;
+      currentTitle: string;
+      memorySummary: string;
+      frequentSites: Array<{
+        title: string;
+        host: string;
+        baseUrl: string;
+        count: number;
+        lastVisited: number;
+        recentUrls: string[];
+        score: number;
+      }>;
+      pageSchema?: string | null;
+      contextNotesSummary?: string;
+    }
+  ): Promise<string> {
+    const systemPrompt = `You are an AI browsing copilot.
+You can suggest navigation actions and simple page actions.
+Return ONLY valid JSON with this shape:
+{
+  "response": "Assistant response to show the user",
+  "actions": [
+    { "type": "open_url", "url": "https://example.com", "inNewTab": false },
+    { "type": "search", "query": "search terms" },
+    { "type": "suggest_sites", "suggestions": ["https://..."] },
+    { "type": "create_site", "prompt": "short creation brief", "creationType": "webpage|app|game" },
+    {
+      "type": "page_actions",
+      "plan": {
+        "actions": [
+          { "type": "click|type|select|press|focus|scroll", "selector": "...", "text": "...", "value": "...", "key": "Enter", "by": 300, "to": 1200 }
+        ],
+        "notes": "short explanation"
+      }
+    }
+  ],
+  "notes": "optional short notes"
+}
+Rules:
+- Prefer frequent sites when the user's intent matches them.
+- Use open_url for direct navigation.
+- Use search when the user wants to find something but no site is obvious.
+- Use create_site when the user wants something that doesn't exist or is best served by a custom page/app.
+- Only include page_actions when confident.
+- If no action is needed, return an empty actions array.`;
+
+    const trimmedSites = context.frequentSites.slice(0, 10).map(site => ({
+      ...site,
+      recentUrls: site.recentUrls.slice(0, 4)
+    }));
+
+    const message = `User request:
+${userRequest}
+
+Current page:
+- Title: ${context.currentTitle}
+- URL: ${context.currentUrl}
+
+Frequent sites (JSON):
+${JSON.stringify(trimmedSites).substring(0, 20000)}
+
+Frequent sites summary:
+${context.memorySummary}
+
+    ${context.pageSchema ? `Page schema (JSON):\n${context.pageSchema.substring(0, 30000)}` : ''}
+
+${context.contextNotesSummary ? `User context notes:\n${context.contextNotesSummary.substring(0, 8000)}` : ''}`;
+
+    return await this.chat(message, systemPrompt);
+  }
+
   async generateExtension(request: string, domSnapshot: any): Promise<string> {
     const systemPrompt = `You are an expert browser extension generator.
 You MUST output ONLY valid JSON with this shape:
@@ -362,6 +439,33 @@ ${request}
 
 DOM snapshot:
 ${snapshotText}`;
+
+    return await this.chat(message, systemPrompt);
+  }
+
+  async generateCreation(prompt: string, type: 'webpage' | 'game' | 'app'): Promise<string> {
+    const systemPrompt = `You are an expert creative web developer.
+You MUST output ONLY valid JSON with this shape:
+{
+  "title": "Short descriptive title",
+  "type": "webpage|game|app",
+  "description": "One sentence summary",
+  "html": "Complete single-file HTML with inline CSS and JS"
+}
+Rules:
+- The "html" field must be a JSON string with escaped newlines and quotes.
+- Use a single HTML file (no external assets, no CDNs, no frameworks).
+- Include all CSS in a <style> tag and all JS in a <script> tag.
+- The output must run offline in a browser.
+- Do not wrap the JSON in markdown or backticks.`;
+
+    const message = `Create a ${type} based on this prompt:
+${prompt}
+
+Constraints:
+- Keep it lightweight and self-contained.
+- Prefer semantic HTML and accessible UI.
+- Include brief in-app instructions if it's a game or interactive app.`;
 
     return await this.chat(message, systemPrompt);
   }

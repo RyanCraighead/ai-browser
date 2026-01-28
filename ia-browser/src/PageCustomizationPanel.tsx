@@ -30,15 +30,28 @@ export const PageCustomizationPanel: React.FC<PageCustomizationPanelProps> = ({
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [showTemplateDialog, setShowTemplateDialog] = useState(false);
   const [templateName, setTemplateName] = useState('');
-  const [transformationType, setTransformationType] = useState<TransformationRule['type']>('style');
-  const [customStyles, setCustomStyles] = useState<Record<string, string>>({});
+
+
 
   const customizationService = PageCustomizationService.getInstance();
 
   useEffect(() => {
+    if (!webview) return;
     customizationService.setWebview(webview);
     loadTemplates();
-    analyzePage();
+    const handleFinish = () => {
+      analyzePage();
+    };
+    if (typeof webview.isLoading === 'function' && webview.isLoading()) {
+      webview.addEventListener('did-finish-load', handleFinish);
+    } else {
+      analyzePage();
+    }
+    return () => {
+      if (typeof webview.removeEventListener === 'function') {
+        webview.removeEventListener('did-finish-load', handleFinish);
+      }
+    };
   }, [webview, url]);
 
   const loadTemplates = () => {
@@ -58,7 +71,7 @@ export const PageCustomizationPanel: React.FC<PageCustomizationPanelProps> = ({
     try {
       const pageAnalysis = await customizationService.analyzePage(url);
       setAnalysis(pageAnalysis);
-      
+
       const restructuringSuggestions = await customizationService.getRestructuringSuggestions();
       setSuggestions(restructuringSuggestions);
     } catch (error) {
@@ -92,7 +105,7 @@ export const PageCustomizationPanel: React.FC<PageCustomizationPanelProps> = ({
       id: crypto.randomUUID(),
       type,
       selector: selector || `[data-ai-selected="true"]`,
-      styles: customStyles
+      styles: {}
     };
 
     await customizationService.applyTransformation(rule);
@@ -126,7 +139,7 @@ export const PageCustomizationPanel: React.FC<PageCustomizationPanelProps> = ({
     saveTemplates(newTemplates);
     setShowTemplateDialog(false);
     setTemplateName('');
-    
+
     if (onSaveTemplate) {
       onSaveTemplate(template);
     }
@@ -135,7 +148,7 @@ export const PageCustomizationPanel: React.FC<PageCustomizationPanelProps> = ({
   const handleApplyTemplate = async (template: PageTemplate) => {
     await customizationService.applyTemplate(template);
     analyzePage();
-    
+
     if (onLoadTemplate) {
       onLoadTemplate(template);
     }
@@ -251,19 +264,19 @@ export const PageCustomizationPanel: React.FC<PageCustomizationPanelProps> = ({
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', fontSize: '11px' }}>
                 <div style={{ color: '#666' }}>Elements:</div>
                 <div style={{ color: '#fff' }}>{analysis.elementCount.toLocaleString()}</div>
-                
+
                 <div style={{ color: '#666' }}>Images:</div>
                 <div style={{ color: '#fff' }}>{analysis.imageCount}</div>
-                
+
                 <div style={{ color: '#666' }}>Links:</div>
                 <div style={{ color: '#fff' }}>{analysis.linkCount}</div>
-                
+
                 <div style={{ color: '#666' }}>Forms:</div>
                 <div style={{ color: '#fff' }}>{analysis.formCount}</div>
-                
+
                 <div style={{ color: '#666' }}>Reading Time:</div>
                 <div style={{ color: '#fff' }}>{analysis.estimatedReadingTime} min</div>
-                
+
                 <div style={{ color: '#666' }}>Sections:</div>
                 <div style={{ color: '#fff' }}>{analysis.structure.sections.length}</div>
               </div>
@@ -307,7 +320,7 @@ export const PageCustomizationPanel: React.FC<PageCustomizationPanelProps> = ({
                 ✕ Clear
               </button>
             </div>
-            
+
             {selectedElements.length > 0 && (
               <div style={{
                 background: '#111',
@@ -502,10 +515,10 @@ export const PageCustomizationPanel: React.FC<PageCustomizationPanelProps> = ({
 
         {/* Templates */}
         <div style={{ marginBottom: '20px' }}>
-          <div style={{ 
-            fontSize: '12px', 
-            fontWeight: 'bold', 
-            color: '#888', 
+          <div style={{
+            fontSize: '12px',
+            fontWeight: 'bold',
+            color: '#888',
             marginBottom: '8px',
             display: 'flex',
             justifyContent: 'space-between',
@@ -527,7 +540,7 @@ export const PageCustomizationPanel: React.FC<PageCustomizationPanelProps> = ({
               + Save
             </button>
           </div>
-          
+
           {templates.length === 0 ? (
             <div style={{
               padding: '20px',

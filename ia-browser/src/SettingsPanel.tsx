@@ -42,15 +42,16 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
     try {
       // Temporarily update service config for testing
       cerebrasService.saveConfig(config);
-      
+
       // Test with a simple request
-      const response = await cerebrasService.chat('Hello! This is a test message.', 'You are a helpful assistant.');
-      
+      // Test with a simple request
+      await cerebrasService.chat('Hello! This is a test message.', 'You are a helpful assistant.');
+
       setTestResult({ success: true, message: 'Connection successful! API is working correctly.' });
     } catch (error: any) {
-      setTestResult({ 
-        success: false, 
-        message: `Connection failed: ${error.message}` 
+      setTestResult({
+        success: false,
+        message: `Connection failed: ${error.message}`
       });
     } finally {
       setIsTesting(false);
@@ -118,10 +119,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
       <div style={{ flex: 1, overflowY: 'auto', padding: '16px' }}>
         {/* API Configuration */}
         <div style={{ marginBottom: '24px' }}>
-          <div style={{ 
-            fontSize: '12px', 
-            fontWeight: 'bold', 
-            color: '#888', 
+          <div style={{
+            fontSize: '12px',
+            fontWeight: 'bold',
+            color: '#888',
             marginBottom: '12px',
             display: 'flex',
             alignItems: 'center',
@@ -133,11 +134,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
 
           {/* API Key */}
           <div style={{ marginBottom: '16px' }}>
-            <label style={{ 
-              display: 'block', 
-              fontSize: '12px', 
-              color: '#aaa', 
-              marginBottom: '6px' 
+            <label style={{
+              display: 'block',
+              fontSize: '12px',
+              color: '#aaa',
+              marginBottom: '6px'
             }}>
               API Key *
             </label>
@@ -179,9 +180,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
             </div>
             <div style={{ fontSize: '11px', color: '#666', marginTop: '4px' }}>
               Get your API key from{' '}
-              <a 
-                href="https://cloud.cerebras.ai" 
-                target="_blank" 
+              <a
+                href="https://cloud.cerebras.ai"
+                target="_blank"
                 rel="noopener noreferrer"
                 style={{ color: '#2563eb' }}
               >
@@ -192,11 +193,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
 
           {/* Model */}
           <div style={{ marginBottom: '16px' }}>
-            <label style={{ 
-              display: 'block', 
-              fontSize: '12px', 
-              color: '#aaa', 
-              marginBottom: '6px' 
+            <label style={{
+              display: 'block',
+              fontSize: '12px',
+              color: '#aaa',
+              marginBottom: '6px'
             }}>
               Model
             </label>
@@ -222,11 +223,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
 
           {/* Temperature */}
           <div style={{ marginBottom: '16px' }}>
-            <label style={{ 
-              display: 'block', 
-              fontSize: '12px', 
-              color: '#aaa', 
-              marginBottom: '6px' 
+            <label style={{
+              display: 'block',
+              fontSize: '12px',
+              color: '#aaa',
+              marginBottom: '6px'
             }}>
               Temperature: {config.temperature}
             </label>
@@ -251,11 +252,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
 
           {/* Top P */}
           <div style={{ marginBottom: '16px' }}>
-            <label style={{ 
-              display: 'block', 
-              fontSize: '12px', 
-              color: '#aaa', 
-              marginBottom: '6px' 
+            <label style={{
+              display: 'block',
+              fontSize: '12px',
+              color: '#aaa',
+              marginBottom: '6px'
             }}>
               Top P: {config.topP}
             </label>
@@ -278,11 +279,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
 
           {/* Max Tokens */}
           <div style={{ marginBottom: '16px' }}>
-            <label style={{ 
-              display: 'block', 
-              fontSize: '12px', 
-              color: '#aaa', 
-              marginBottom: '6px' 
+            <label style={{
+              display: 'block',
+              fontSize: '12px',
+              color: '#aaa',
+              marginBottom: '6px'
             }}>
               Max Tokens
             </label>
@@ -311,13 +312,13 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
 
           {/* Reasoning Toggle */}
           <div style={{ marginBottom: '16px' }}>
-            <label style={{ 
-              display: 'flex', 
-              alignItems: 'center', 
+            <label style={{
+              display: 'flex',
+              alignItems: 'center',
               gap: '8px',
-              fontSize: '12px', 
-              color: '#aaa', 
-              cursor: 'pointer' 
+              fontSize: '12px',
+              color: '#aaa',
+              cursor: 'pointer'
             }}>
               <input
                 type="checkbox"
@@ -335,11 +336,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
 
         {/* Action Buttons */}
         <div style={{ marginBottom: '24px' }}>
-          <div style={{ 
-            fontSize: '12px', 
-            fontWeight: 'bold', 
-            color: '#888', 
-            marginBottom: '12px' 
+          <div style={{
+            fontSize: '12px',
+            fontWeight: 'bold',
+            color: '#888',
+            marginBottom: '12px'
           }}>
             ACTIONS
           </div>
@@ -411,28 +412,28 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
 
         {/* Help Section */}
         <div>
-          <div style={{ 
-            fontSize: '12px', 
-            fontWeight: 'bold', 
-            color: '#888', 
-            marginBottom: '12px' 
+          <div style={{
+            fontSize: '12px',
+            fontWeight: 'bold',
+            color: '#888',
+            marginBottom: '12px'
           }}>
             📚 HELP & RESOURCES
           </div>
 
-          <div style={{ 
-            background: 'rgba(12, 18, 28, 0.8)', 
-            borderRadius: '6px', 
+          <div style={{
+            background: 'rgba(12, 18, 28, 0.8)',
+            borderRadius: '6px',
             padding: '12px',
-            border: '1px solid var(--border)' 
+            border: '1px solid var(--border)'
           }}>
             <div style={{ marginBottom: '8px' }}>
-              <a 
-                href="https://cloud.cerebras.ai" 
-                target="_blank" 
+              <a
+                href="https://cloud.cerebras.ai"
+                target="_blank"
                 rel="noopener noreferrer"
-                style={{ 
-                  color: '#2563eb', 
+                style={{
+                  color: '#2563eb',
                   fontSize: '12px',
                   textDecoration: 'none'
                 }}
@@ -441,12 +442,12 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
               </a>
             </div>
             <div style={{ marginBottom: '8px' }}>
-              <a 
-                href="https://inference-docs.cerebras.ai" 
-                target="_blank" 
+              <a
+                href="https://inference-docs.cerebras.ai"
+                target="_blank"
                 rel="noopener noreferrer"
-                style={{ 
-                  color: '#2563eb', 
+                style={{
+                  color: '#2563eb',
                   fontSize: '12px',
                   textDecoration: 'none'
                 }}

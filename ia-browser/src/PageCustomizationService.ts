@@ -9,12 +9,12 @@ import {
 export class PageCustomizationService {
   private static instance: PageCustomizationService;
   private webview: any = null;
-  private selectedElements: Set<string> = new Set();
+
   private currentMode: CustomizationMode = 'inspect';
   private transformations: TransformationRule[] = [];
-  private inspectionCallback: ((element: any) => void) | null = null;
 
-  private constructor() {}
+
+  private constructor() { }
 
   static getInstance(): PageCustomizationService {
     if (!PageCustomizationService.instance) {
@@ -255,9 +255,9 @@ export class PageCustomizationService {
               element.style.backgroundColor = 'rgba(245,158,11,0.1)';
               break;
             case 'style':
-              ${rule.styles ? Object.entries(rule.styles).map(([key, value]) => 
-                `element.style.${key} = '${value}';`
-              ).join('\n') : ''}
+              ${rule.styles ? Object.entries(rule.styles).map(([key, value]) =>
+      `element.style.${key} = '${value}';`
+    ).join('\n') : ''}
               break;
             case 'replace':
               element.innerHTML = '${rule.content || ''}';
@@ -440,8 +440,8 @@ export class PageCustomizationService {
     return [...this.transformations];
   }
 
-  setInspectionCallback(callback: (element: any) => void) {
-    this.inspectionCallback = callback;
+  setInspectionCallback(_callback: (element: any) => void) {
+    // this.inspectionCallback = callback;
   }
 
   // AI-powered restructuring suggestions
@@ -458,8 +458,10 @@ export class PageCustomizationService {
           suggestions.push('🔹 Navigation has ' + navLinks + ' links. Consider grouping into categories.');
         }
         
+        const allElements = Array.from(document.querySelectorAll('*'));
+
         // Check for small text
-        const smallText = document.querySelectorAll('*').filter(el => {
+        const smallText = allElements.filter(el => {
           const style = getComputedStyle(el);
           return parseFloat(style.fontSize) < 12 && el.textContent?.trim().length > 50;
         });
@@ -474,8 +476,7 @@ export class PageCustomizationService {
         }
         
         // Check for lack of whitespace
-        const elements = document.querySelectorAll('*');
-        const cramped = Array.from(elements).filter(el => {
+        const cramped = allElements.filter(el => {
           const style = getComputedStyle(el);
           return parseFloat(style.padding) < 8 && parseFloat(style.margin) < 8 && el.textContent?.trim().length > 100;
         });
