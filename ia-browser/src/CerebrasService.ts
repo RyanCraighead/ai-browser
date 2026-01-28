@@ -361,10 +361,16 @@ ${pageSchema.substring(0, 60000)}`;
       }>;
       pageSchema?: string | null;
       contextNotesSummary?: string;
+      goal?: string;
+      successCriteria?: string[];
+      planSteps?: string[];
+      stepIndex?: number;
+      lastActionSummary?: string;
     }
   ): Promise<string> {
     const systemPrompt = `You are an AI browsing copilot.
 You can suggest navigation actions and simple page actions.
+You operate in a multi-step loop: the user keeps chatting and you will be called again after each page loads.
 Return ONLY valid JSON with this shape:
 {
   "response": "Assistant response to show the user",
@@ -391,6 +397,10 @@ Rules:
 - Use search when the user wants to find something but no site is obvious.
 - Use create_site when the user wants something that doesn't exist or is best served by a custom page/app.
 - Only include page_actions when confident.
+- If the user's goal is to find a person/page/site or move to a different site, prefer navigation/search over page_actions.
+- Only use page_actions when the current page is clearly relevant to the goal.
+- If a navigation is needed, include ONLY that navigation action and no page_actions (you will get another turn after load).
+- If the goal appears complete on the current page, return empty actions and explain in response.
 - If no action is needed, return an empty actions array.`;
 
     const trimmedSites = context.frequentSites.slice(0, 10).map(site => ({
@@ -400,6 +410,16 @@ Rules:
 
     const message = `User request:
 ${userRequest}
+
+${context.goal ? `Goal:\n${context.goal}` : ''}
+
+${context.planSteps?.length ? `Goal plan steps:\n${context.planSteps.slice(0, 8).map((step, idx) => `${idx + 1}. ${step}`).join('\n')}` : ''}
+
+${context.successCriteria?.length ? `Success criteria:\n${context.successCriteria.slice(0, 6).map(item => `- ${item}`).join('\n')}` : ''}
+
+${context.stepIndex ? `Current step: ${context.stepIndex}` : ''}
+
+${context.lastActionSummary ? `Last action summary: ${context.lastActionSummary}` : ''}
 
 Current page:
 - Title: ${context.currentTitle}
@@ -414,6 +434,69 @@ ${context.memorySummary}
     ${context.pageSchema ? `Page schema (JSON):\n${context.pageSchema.substring(0, 30000)}` : ''}
 
 ${context.contextNotesSummary ? `User context notes:\n${context.contextNotesSummary.substring(0, 8000)}` : ''}`;
+
+    return await this.chat(message, systemPrompt);
+  }
+
+  async planGoalTask(userRequest: string): Promise<string> {
+    const systemPrompt = `You are a goal and task planner for a browsing agent.
+Return ONLY valid JSON with this shape:
+{
+  "goal": "short goal statement",
+  "steps": ["short step 1", "short step 2"],
+  "successCriteria": ["how to know the goal is complete"],
+  "questions": ["optional clarifying questions if needed"]
+}
+Rules:
+- Keep steps short and action-oriented.
+- Ask questions only if essential details are missing.
+- Do not include any extra text outside JSON.`;
+
+    const message = `User request:
+${userRequest}`;
+
+    return await this.chat(message, systemPrompt);
+  }
+
+  async checkGoalCompletion(
+    goal: string,
+    userRequest: string,
+    page: { url: string; title: string; content: string },
+    planSteps?: string[],
+    lastActionSummary?: string
+  ): Promise<string> {
+    const systemPrompt = `You are a goal completion evaluator for a browsing agent.
+Return ONLY valid JSON with this shape:
+{
+  "completed": true,
+  "response": "short message to the user",
+  "needsUserInput": false,
+  "question": "optional follow-up question",
+  "evidence": "short evidence from the page",
+  "confidence": 0.0
+}
+Rules:
+- If the goal is not met, set "completed": false.
+- If essential details are missing, set "needsUserInput": true and include "question".
+- Do NOT mark search results pages as complete unless the exact target page is open.
+- Keep responses concise and grounded in the page content.`;
+
+    const message = `Goal:
+${goal}
+
+User request:
+${userRequest}
+
+${planSteps?.length ? `Goal plan steps:\n${planSteps.slice(0, 8).map((step, idx) => `${idx + 1}. ${step}`).join('\n')}` : ''}
+
+${lastActionSummary ? `Last action summary:\n${lastActionSummary}` : ''}
+
+Current page:
+Title: ${page.title}
+URL: ${page.url}
+
+Content:
+${page.content.substring(0, 60000)}`;
 
     return await this.chat(message, systemPrompt);
   }

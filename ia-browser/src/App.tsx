@@ -139,6 +139,22 @@ type ChatBrowsingPlan = {
   notes?: string;
 };
 
+type GoalPlan = {
+  goal: string;
+  steps: string[];
+  successCriteria?: string[];
+  questions?: string[];
+};
+
+type GoalCheck = {
+  completed: boolean;
+  response?: string;
+  needsUserInput?: boolean;
+  question?: string;
+  evidence?: string;
+  confidence?: number;
+};
+
 const tryParseJson = (raw: string) => {
   try {
     return JSON.parse(raw);
@@ -500,6 +516,115 @@ const sanitizeFileName = (value: string) => {
   return trimmed.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim();
 };
 
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const extractDomainsFromText = (text: string) => {
+  const matches = text.toLowerCase().match(/([a-z0-9-]+\.)+[a-z]{2,}/g) || [];
+  return Array.from(new Set(matches));
+};
+
+const KNOWN_SITES: Array<{ label: string; host: string; url: string }> = [
+  { label: 'youtube', host: 'youtube.com', url: 'https://www.youtube.com' },
+  { label: 'facebook', host: 'facebook.com', url: 'https://www.facebook.com' },
+  { label: 'instagram', host: 'instagram.com', url: 'https://www.instagram.com' },
+  { label: 'tiktok', host: 'tiktok.com', url: 'https://www.tiktok.com' },
+  { label: 'twitter', host: 'twitter.com', url: 'https://twitter.com' },
+  { label: 'x', host: 'x.com', url: 'https://x.com' },
+  { label: 'reddit', host: 'reddit.com', url: 'https://www.reddit.com' }
+];
+
+const getDirectNavigationTarget = (text: string) => {
+  const lower = text.toLowerCase();
+  for (const site of KNOWN_SITES) {
+    if (lower.includes(site.label) || lower.includes(site.host)) {
+      return site.url;
+    }
+  }
+  const domains = extractDomainsFromText(lower);
+  if (domains.length) {
+    return `https://${domains[0]}`;
+  }
+  return '';
+};
+
+const extractSearchQueryFromGoal = (text: string) => {
+  const lower = text.toLowerCase();
+  const cleaned = lower
+    .replace(/go to/g, ' ')
+    .replace(/navigate to/g, ' ')
+    .replace(/open/g, ' ')
+    .replace(/find/g, ' ')
+    .replace(/channel/g, ' ')
+    .replace(/youtube/g, ' ')
+    .replace(/on youtube/g, ' ')
+    .replace(/the/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || text.trim();
+};
+
+const isDomainRelevantToGoal = (text: string, url: string) => {
+  if (!url || url.startsWith('data:') || url.startsWith('about:') || url.startsWith('file:')) {
+    return false;
+  }
+  let host = '';
+  try {
+    host = new URL(url).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (!host) return false;
+
+  const lowerText = text.toLowerCase();
+  const searchHosts = ['duckduckgo.com', 'www.duckduckgo.com', 'google.com', 'www.google.com', 'bing.com', 'www.bing.com'];
+  if (searchHosts.includes(host)) {
+    return true;
+  }
+
+  const explicitDomains = extractDomainsFromText(lowerText);
+  if (explicitDomains.length) {
+    return explicitDomains.some((domain) => host.includes(domain) || domain.includes(host));
+  }
+
+  const stopwords = new Set([
+    'about', 'after', 'again', 'also', 'another', 'before', 'being', 'could',
+    'first', 'found', 'from', 'have', 'here', 'just', 'like', 'more', 'most',
+    'other', 'over', 'page', 'people', 'should', 'their', 'there', 'these',
+    'thing', 'those', 'this', 'want', 'when', 'where', 'which', 'while', 'would',
+    'with', 'your', 'them', 'then'
+  ]);
+  const tokens = lowerText.split(/[^a-z0-9]+/).filter(Boolean);
+  const keywordHits = tokens
+    .filter((token) => token.length >= 4 && !stopwords.has(token))
+    .some((token) => host.includes(token));
+
+  return keywordHits;
+};
+
+const waitForWebviewEvent = (wv: any, events: string[], timeoutMs = 12000) => {
+  if (!wv) return Promise.resolve(false);
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const handler = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(true);
+    };
+    const cleanup = () => {
+      events.forEach(eventName => wv.removeEventListener(eventName, handler));
+      clearTimeout(timer);
+    };
+    events.forEach(eventName => wv.addEventListener(eventName, handler));
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(false);
+    }, timeoutMs);
+  });
+};
+
 export default function App() {
   const [homeConfig, setHomeConfig] = useState<HomeConfig>(DEFAULT_HOME_CONFIG);
   const [homePanelOpen, setHomePanelOpen] = useState(false);
@@ -639,6 +764,8 @@ export default function App() {
   const extensionsRef = useRef(extensions);
   const creationUrlsRef = useRef<Record<string, string>>({});
   const homeUrlRef = useRef<string | null>(null);
+  const activeIdRef = useRef(activeId);
+  const tabsRef = useRef(tabs);
 
   const activeTab = useMemo(() => tabs.find(t => t.id === activeId)!, [tabs, activeId]);
   const isChatBrowser = browserMode === 'chat';
@@ -646,6 +773,14 @@ export default function App() {
   useEffect(() => {
     extensionsRef.current = extensions;
   }, [extensions]);
+
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
+
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
 
   useEffect(() => {
     homeUrlRef.current = homePageUrl;
@@ -1010,9 +1145,9 @@ export default function App() {
     });
   };
 
-  const getPageContent = async (): Promise<{ url: string; content: string }> => {
-    const wv = webviewsRef.current[activeId];
-    if (!wv) return { url: "", content: "" };
+  const getPageContent = async (): Promise<{ url: string; content: string; title?: string }> => {
+    const wv = getActiveWebview();
+    if (!wv) return { url: "", content: "", title: "" };
 
     try {
       const content = await wv.executeJavaScript(`
@@ -1030,13 +1165,17 @@ export default function App() {
         })()
       `);
 
+      const activeTabSnapshot = tabsRef.current.find(t => t.id === activeIdRef.current);
+      const pageTitle = content.title || activeTabSnapshot?.title || activeTab.title || "Untitled";
+      const pageUrl = wv.getURL?.() ?? activeTabSnapshot?.url ?? activeTab.url;
       return {
-        url: activeTab.url,
-        content: `Title: ${content.title}\n\nContent:\n${content.content}`
+        url: pageUrl,
+        title: pageTitle,
+        content: `Title: ${pageTitle}\n\nContent:\n${content.content}`
       };
     } catch (error) {
       console.error("Failed to get page content:", error);
-      return { url: "", content: "" };
+      return { url: "", content: "", title: "" };
     }
   };
 
@@ -1135,8 +1274,10 @@ export default function App() {
 
   const ensurePageSchema = async () => {
     if (!cerebrasService.isConfigured()) return null;
+    const wv = getActiveWebview();
+    const currentUrl = wv?.getURL?.() ?? activeTab.url;
     const now = Date.now();
-    if (pageSchema && pageSchemaUrl === activeTab.url && now - pageSchemaUpdatedAt < 120000) {
+    if (pageSchema && pageSchemaUrl === currentUrl && now - pageSchemaUpdatedAt < 120000) {
       return { schemaText: pageSchema, snapshot: lastDomSnapshot };
     }
     setSchemaStatus('building');
@@ -1148,7 +1289,7 @@ export default function App() {
       }
       const schemaText = await cerebrasService.buildPageSchema(snapshot);
       setPageSchema(schemaText);
-      setPageSchemaUrl(activeTab.url);
+      setPageSchemaUrl(currentUrl);
       setPageSchemaUpdatedAt(Date.now());
       setLastDomSnapshot(snapshot);
       setSchemaStatus('ready');
@@ -1212,6 +1353,51 @@ export default function App() {
     }
 
     return { response, actions: cleaned, notes };
+  };
+
+  const parseGoalPlan = (raw: string): GoalPlan | null => {
+    const parsed = extractJsonPayload(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const goal = typeof (parsed as any).goal === 'string' ? (parsed as any).goal.trim() : '';
+    const stepsRaw = Array.isArray((parsed as any).steps) ? (parsed as any).steps : [];
+    const steps = stepsRaw.filter((step: unknown) => typeof step === 'string')
+      .map((step: string) => step.trim())
+      .filter(Boolean);
+    const successRaw = Array.isArray((parsed as any).successCriteria) ? (parsed as any).successCriteria : [];
+    const successCriteria = successRaw.filter((item: unknown) => typeof item === 'string')
+      .map((item: string) => item.trim())
+      .filter(Boolean);
+    const questionRaw = Array.isArray((parsed as any).questions) ? (parsed as any).questions : [];
+    const questions = questionRaw.filter((item: unknown) => typeof item === 'string')
+      .map((item: string) => item.trim())
+      .filter(Boolean);
+    if (!goal && steps.length === 0) return null;
+    return {
+      goal: goal || '',
+      steps,
+      successCriteria: successCriteria.length ? successCriteria : undefined,
+      questions: questions.length ? questions : undefined
+    };
+  };
+
+  const parseGoalCheck = (raw: string): GoalCheck | null => {
+    const parsed = extractJsonPayload(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const completed = Boolean((parsed as any).completed);
+    const response = typeof (parsed as any).response === 'string' ? (parsed as any).response.trim() : undefined;
+    const needsUserInput = Boolean((parsed as any).needsUserInput);
+    const question = typeof (parsed as any).question === 'string' ? (parsed as any).question.trim() : undefined;
+    const evidence = typeof (parsed as any).evidence === 'string' ? (parsed as any).evidence.trim() : undefined;
+    const confidence =
+      typeof (parsed as any).confidence === 'number' ? (parsed as any).confidence : undefined;
+    return {
+      completed,
+      response: response || undefined,
+      needsUserInput: needsUserInput || undefined,
+      question: question || undefined,
+      evidence: evidence || undefined,
+      confidence
+    };
   };
 
   const executeActionPlan = async (plan: ActionPlan) => {
@@ -1712,76 +1898,275 @@ ${editingHtml.substring(0, 80000)}`;
     setIsLoading(true);
 
     try {
-      const schemaBundle = await ensurePageSchema();
-      const schemaText = schemaBundle?.schemaText || null;
-      const domSnapshot = schemaBundle?.snapshot || null;
-      let navigationOccurred = false;
+      let schemaText: string | null = null;
+      let domSnapshot: any = null;
       let chatModeAnswered = false;
       let chatModeExecutedPageActions = false;
+      let goalHint = userMessage;
+      const explicitActionRequest = /\b(click|type|fill|scroll|select|press|submit|enter|choose|tick|check|on this page|this page|open menu)\b/i.test(userMessage);
+      const immediateTarget = getDirectNavigationTarget(userMessage);
+      const initialUrl = getActiveWebview()?.getURL?.() ?? activeTab.url;
+      const initialIsHome = !initialUrl || initialUrl.startsWith('data:') || initialUrl.startsWith('about:');
+
+      if (immediateTarget && initialIsHome && !explicitActionRequest) {
+        const target = navigateTo(immediateTarget, false);
+        if (target) {
+          setMessages(prev => [
+            ...prev,
+            { role: 'assistant', content: `Navigating to ${target}` }
+          ]);
+          await delay(300);
+          await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+        }
+      }
 
       if (chatModeEnabled && cerebrasService.isConfigured()) {
         try {
           const memorySummary = visitMemoryService.getMemorySummary(8);
           const contextSummary = buildContextSummary();
-          const planRaw = await cerebrasService.planChatBrowsing(userMessage, {
-            currentUrl: activeTab.url,
-            currentTitle: activeTab.title || "Untitled",
-            memorySummary,
-            frequentSites,
-            pageSchema: schemaText,
-            contextNotesSummary: contextSummary
-          });
-          const browsingPlan = parseChatBrowsingPlan(planRaw);
+          const goalPlanRaw = await cerebrasService.planGoalTask(userMessage);
+          const goalPlan = parseGoalPlan(goalPlanRaw);
+          const goalText = goalPlan?.goal?.trim() || userMessage;
+          goalHint = goalText;
 
-          if (browsingPlan) {
+          if (goalPlan && (goalPlan.goal || goalPlan.steps.length || goalPlan.successCriteria?.length)) {
+            const planLines = goalPlan.steps.slice(0, 6).map((step, idx) => `${idx + 1}. ${step}`).join('\n');
+            const criteriaLines = goalPlan.successCriteria?.slice(0, 4).map((item) => `- ${item}`).join('\n') || '';
+            const questionLines = goalPlan.questions?.slice(0, 3).map((item) => `- ${item}`).join('\n') || '';
+            const goalLines = [
+              goalPlan.goal ? `Goal: ${goalPlan.goal}` : `Goal: ${goalText}`,
+              planLines ? `Plan:
+${planLines}` : '',
+              criteriaLines ? `Success criteria:
+${criteriaLines}` : '',
+              questionLines ? `Questions:
+${questionLines}` : ''
+            ].filter(Boolean).join('\n\n');
+            if (goalLines) {
+              setMessages(prev => [...prev, { role: 'assistant', content: goalLines }]);
+            }
+            if (goalPlan.questions && goalPlan.questions.length > 0) {
+              setIsLoading(false);
+              return;
+            }
+          }
+
+          let lastActionSummary = '';
+          const maxAgentSteps = 6;
+
+          for (let step = 1; step <= maxAgentSteps; step += 1) {
+            const page = await getPageContent();
+            const goalCheckRaw = await cerebrasService.checkGoalCompletion(
+              goalText,
+              userMessage,
+              {
+                url: page.url,
+                title: page.title || activeTab.title || "Untitled",
+                content: page.content
+              },
+              goalPlan?.steps,
+              lastActionSummary
+            );
+            const goalCheck = parseGoalCheck(goalCheckRaw);
+
+            if (goalCheck?.completed) {
+              const completionMessage = goalCheck.response
+                || goalCheck.evidence
+                || 'Goal completed based on the current page.';
+              setMessages(prev => [...prev, { role: 'assistant', content: completionMessage }]);
+              chatModeAnswered = true;
+              break;
+            }
+
+            if (goalCheck?.needsUserInput || goalCheck?.question) {
+              const followUp = goalCheck.response
+                || goalCheck.question
+                || 'I need more details to continue. What specifics should I use?';
+              setMessages(prev => [...prev, { role: 'assistant', content: followUp }]);
+              chatModeAnswered = true;
+              break;
+            }
+
+            const schemaBundle = await ensurePageSchema();
+            schemaText = schemaBundle?.schemaText || null;
+            domSnapshot = schemaBundle?.snapshot || null;
+
+            const planRaw = await cerebrasService.planChatBrowsing(userMessage, {
+              currentUrl: page.url,
+              currentTitle: page.title || activeTab.title || "Untitled",
+              memorySummary,
+              frequentSites,
+              pageSchema: schemaText,
+              contextNotesSummary: contextSummary,
+              goal: goalText,
+              planSteps: goalPlan?.steps,
+              successCriteria: goalPlan?.successCriteria,
+              stepIndex: step,
+              lastActionSummary
+            });
+            const browsingPlan = parseChatBrowsingPlan(planRaw);
+
+            if (!browsingPlan) {
+              break;
+            }
+
+            if (browsingPlan.response) {
+              setMessages(prev => [...prev, { role: 'assistant', content: browsingPlan.response! }]);
+            }
+
+            if (!browsingPlan.actions.length) {
+              if (browsingPlan.response) {
+                chatModeAnswered = true;
+              }
+              break;
+            }
+
+            let navigationOccurred = false;
+            let actionAttempted = false;
+            const pageDomainRelevant = isDomainRelevantToGoal(`${goalText} ${userMessage}`, page.url);
+            const directTarget = getDirectNavigationTarget(`${goalText} ${userMessage}`);
+            const isHomeLike = !page.url || page.url.startsWith('data:') || page.url.startsWith('about:');
+
+            if (directTarget && !page.url.includes(directTarget.replace(/^https?:\/\//, ''))) {
+              const target = navigateTo(directTarget, false);
+              if (target) {
+                navigationOccurred = true;
+                actionAttempted = true;
+                setMessages(prev => [
+                  ...prev,
+                  { role: 'assistant', content: `Navigating to ${target}` }
+                ]);
+                await delay(300);
+                await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+                lastActionSummary = `Navigated to ${target}.`;
+                continue;
+              }
+            }
+
+            const currentHost = (() => {
+              try {
+                return new URL(page.url).host.toLowerCase();
+              } catch {
+                return '';
+              }
+            })();
+
+            if (currentHost.includes('youtube.com') && !explicitActionRequest) {
+              const query = extractSearchQueryFromGoal(goalText || userMessage);
+              const wv = getActiveWebview();
+              if (wv && query) {
+                try {
+                  const ran = await wv.executeJavaScript(`
+                    (() => {
+                      const query = ${JSON.stringify(query)};
+                      const input = document.querySelector('input#search') || document.querySelector('input[name="search_query"]');
+                      if (!input) return false;
+                      input.focus();
+                      input.value = query;
+                      input.dispatchEvent(new Event('input', { bubbles: true }));
+                      input.dispatchEvent(new Event('change', { bubbles: true }));
+                      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+                      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+                      return true;
+                    })()
+                  `);
+                  if (ran) {
+                    actionAttempted = true;
+                    chatModeExecutedPageActions = true;
+                    setMessages(prev => [
+                      ...prev,
+                      { role: 'assistant', content: `Searching YouTube for "${query}".` }
+                    ]);
+                    await delay(300);
+                    await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+                    lastActionSummary = `Searched YouTube for ${query}.`;
+                    continue;
+                  }
+                } catch {
+                  // Ignore heuristic failures and continue planning.
+                }
+              }
+            }
+            if (directTarget && !page.url.includes(directTarget.replace(/^https?:\/\//, ''))) {
+              const target = navigateTo(directTarget, false);
+              if (target) {
+                navigationOccurred = true;
+                actionAttempted = true;
+                setMessages(prev => [
+                  ...prev,
+                  { role: 'assistant', content: `Navigating to ${target}` }
+                ]);
+                await delay(300);
+                await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+                lastActionSummary = `Navigated to ${target}.`;
+                continue;
+              }
+            }
+
             for (const action of browsingPlan.actions) {
               if (action.type === 'open_url') {
                 const target = navigateTo(action.url, action.inNewTab);
                 if (target) {
                   navigationOccurred = true;
+                  actionAttempted = true;
                   setMessages(prev => [
                     ...prev,
-                    { role: 'assistant', content: `🌐 Navigating to ${target}` }
+                    { role: 'assistant', content: `Navigating to ${target}` }
                   ]);
                 }
-              } else if (action.type === 'search') {
+                break;
+              }
+              if (action.type === 'search') {
                 const target = navigateTo(action.query, false);
                 if (target) {
                   navigationOccurred = true;
+                  actionAttempted = true;
                   setMessages(prev => [
                     ...prev,
-                    { role: 'assistant', content: `🔎 Searching for: ${action.query}` }
+                    { role: 'assistant', content: `Searching for: ${action.query}` }
                   ]);
                 }
-              } else if (action.type === 'suggest_sites') {
+                break;
+              }
+              if (action.type === 'suggest_sites') {
                 const lines = action.suggestions.slice(0, 8).map((s) => `- ${s}`).join('\n');
                 if (lines) {
                   setMessages(prev => [
                     ...prev,
                     {
                       role: 'assistant',
-                      content: `Here are some sites you might want:\n${lines}`
+                      content: `Here are some sites you might want:
+${lines}`
                     }
                   ]);
+                  actionAttempted = true;
                 }
-              } else if (action.type === 'page_actions' && action.plan) {
+                continue;
+              }
+              if (action.type === 'page_actions' && action.plan) {
+                if (isHomeLike || (!explicitActionRequest && !pageDomainRelevant)) {
+                  continue;
+                }
                 const { executed, attempted, results } = await executeActionPlan(action.plan);
-                chatModeExecutedPageActions = attempted > 0;
                 if (attempted > 0) {
+                  actionAttempted = true;
+                  chatModeExecutedPageActions = true;
                   const logId = crypto.randomUUID();
                   setMessages(prev => [
                     ...prev,
                     {
                       id: logId,
                       role: 'assistant',
-                      content: `✅ Executed ${executed}/${attempted} page action(s).`,
+                      content: `Executed ${executed}/${attempted} page action(s).`,
                       kind: 'action-log',
                       actions: results,
                       summary: `Executed ${executed}/${attempted} page action(s).`
                     }
                   ]);
                 }
-              } else if (action.type === 'create_site') {
+                continue;
+              }
+              if (action.type === 'create_site') {
                 const prompt = action.prompt.trim();
                 if (prompt) {
                   const type = action.creationType || creationType;
@@ -1796,35 +2181,99 @@ ${editingHtml.substring(0, 80000)}`;
                   }
                   setMessages(prev => [
                     ...prev,
-                    { role: 'assistant', content: `✨ I can build that for you. I opened the Creator with a prompt.` }
+                    { role: 'assistant', content: 'I opened the Creator with that prompt.' }
                   ]);
                 }
+                chatModeAnswered = true;
+                actionAttempted = true;
+                break;
               }
             }
 
-            if (browsingPlan.response) {
-              setMessages(prev => [...prev, { role: 'assistant', content: browsingPlan.response! }]);
-              if (!browsingPlan.actions.length) {
-                chatModeAnswered = true;
+            if (!navigationOccurred && !actionAttempted && !explicitActionRequest && !pageDomainRelevant) {
+              const fallbackQuery = goalText || userMessage;
+              const target = navigateTo(fallbackQuery, false);
+              if (target) {
+                navigationOccurred = true;
+                actionAttempted = true;
+                setMessages(prev => [
+                  ...prev,
+                  { role: 'assistant', content: `Searching for: ${fallbackQuery}` }
+                ]);
               }
-            } else if (navigationOccurred) {
-              setMessages(prev => [
-                ...prev,
-                { role: 'assistant', content: 'Navigation started. Ask again once the page loads.' }
-              ]);
             }
+
+            if (navigationOccurred) {
+              await delay(300);
+              await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+              const postNavSchema = await ensurePageSchema();
+              schemaText = postNavSchema?.schemaText || null;
+              domSnapshot = postNavSchema?.snapshot || null;
+              if (schemaText) {
+                try {
+                  const nextStepHint = goalPlan?.steps?.[Math.max(0, step - 1)] || goalText;
+                  const goalScopedRequest = `Goal: ${goalText}\nCurrent step: ${nextStepHint}\nUser request: ${userMessage}\nProceed with the most relevant page action on this page to advance the goal.`;
+                  const actionPlanRaw = await cerebrasService.planPageActions(goalScopedRequest, schemaText);
+                  const actionPlan = parseActionPlan(actionPlanRaw);
+                  if (actionPlan && actionPlan.actions.length > 0) {
+                    const { executed, attempted, results } = await executeActionPlan(actionPlan);
+                    if (attempted > 0) {
+                      actionAttempted = true;
+                      chatModeExecutedPageActions = true;
+                      const logId = crypto.randomUUID();
+                      setMessages(prev => [
+                        ...prev,
+                        {
+                          id: logId,
+                          role: 'assistant',
+                          content: `Executed ${executed}/${attempted} page action(s).`,
+                          kind: 'action-log',
+                          actions: results,
+                          summary: `Executed ${executed}/${attempted} page action(s).`
+                        }
+                      ]);
+                    }
+                  }
+                } catch (actionError) {
+                  console.error('Post-navigation action planning failed:', actionError);
+                }
+              }
+            } else if (actionAttempted) {
+              await delay(800);
+            }
+
+            if (browsingPlan.notes) {
+              lastActionSummary = browsingPlan.notes;
+            } else if (actionAttempted) {
+              lastActionSummary = `Step ${step} actions attempted.`;
+            }
+
+            if (chatModeAnswered) break;
           }
         } catch (chatModeError) {
           console.error('Chat browsing planner failed:', chatModeError);
         }
-
-        if (navigationOccurred) {
-          setIsLoading(false);
-          return;
-        }
       }
 
-      if (schemaText && !chatModeExecutedPageActions) {
+      if (chatModeAnswered) {
+        setIsLoading(false);
+        return;
+      }
+
+      if (!schemaText) {
+        const schemaBundle = await ensurePageSchema();
+        schemaText = schemaBundle?.schemaText || null;
+        domSnapshot = schemaBundle?.snapshot || null;
+      }
+
+      const currentUrl = getActiveWebview()?.getURL?.() ?? activeTab.url;
+      const domainRelevant = isDomainRelevantToGoal(`${goalHint} ${userMessage}`, currentUrl);
+      const shouldAttemptPageActions =
+        (!chatModeEnabled || !cerebrasService.isConfigured()) ||
+        explicitActionRequest ||
+        domainRelevant;
+
+      if (schemaText && !chatModeExecutedPageActions && shouldAttemptPageActions) {
         try {
           const actionPlanRaw = await cerebrasService.planPageActions(userMessage, schemaText);
           const actionPlan = parseActionPlan(actionPlanRaw);
@@ -1837,7 +2286,7 @@ ${editingHtml.substring(0, 80000)}`;
                 {
                   id: logId,
                   role: 'assistant',
-                  content: `✅ Executed ${executed}/${attempted} page action(s).`,
+                  content: `Executed ${executed}/${attempted} page action(s).`,
                   kind: 'action-log',
                   actions: results,
                   summary: `Executed ${executed}/${attempted} page action(s).`
@@ -1849,23 +2298,18 @@ ${editingHtml.substring(0, 80000)}`;
           console.error('Automation planning failed:', actionError);
           setMessages(prev => [
             ...prev,
-            { role: 'assistant', content: '⚠️ Unable to run page actions, continuing with answer.' }
+            { role: 'assistant', content: 'Unable to run page actions, continuing with answer.' }
           ]);
         }
       }
 
-      if (chatModeAnswered) {
-        setIsLoading(false);
-        return;
-      }
-
-      const { content } = await getPageContent();
-      const title = activeTab.title || "Untitled";
+      const { content, title } = await getPageContent();
+      const resolvedTitle = title || activeTab.title || "Untitled";
       const contextSummary = buildContextSummary();
       const response = await cerebrasService.chatWithPageAndSchema(
         userMessage,
         content,
-        title,
+        resolvedTitle,
         schemaText || undefined,
         domSnapshot || undefined,
         contextSummary || undefined
@@ -1951,7 +2395,7 @@ ${editingHtml.substring(0, 80000)}`;
     setMemoryPanelOpen(false);
   };
 
-  const getActiveWebview = () => webviewsRef.current[activeId];
+  const getActiveWebview = () => webviewsRef.current[activeIdRef.current];
 
   const runFindInPage = (query: string, opts?: { forward?: boolean }) => {
     const wv = getActiveWebview();
