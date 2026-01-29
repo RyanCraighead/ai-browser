@@ -675,26 +675,6 @@ const isDomainRelevantToGoal = (text: string, url: string) => {
 type WebviewWaiter = { cleanup: () => void };
 const webviewWaiters = new WeakMap<any, WebviewWaiter>();
 
-const isWebviewConnected = (wv: any) => {
-  if (!wv) return false;
-  if (typeof wv.isConnected === 'boolean') return wv.isConnected;
-  try {
-    return typeof document !== 'undefined' && document.contains(wv);
-  } catch {
-    return false;
-  }
-};
-
-const waitForWebviewConnected = async (wv: any, timeoutMs = 2000) => {
-  if (isWebviewConnected(wv)) return true;
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    await new Promise(resolve => setTimeout(resolve, 50));
-    if (isWebviewConnected(wv)) return true;
-  }
-  return false;
-};
-
 const waitForWebviewEvent = (wv: any, events: string[], timeoutMs = 12000) => {
   if (!wv) return Promise.resolve(false);
   const existing = webviewWaiters.get(wv);
@@ -727,11 +707,6 @@ const waitForWebviewEvent = (wv: any, events: string[], timeoutMs = 12000) => {
 
 const ensureWebviewReady = async (wv: any, timeoutMs = 12000) => {
   if (!wv) return false;
-  const attached = await waitForWebviewConnected(wv, Math.min(2000, timeoutMs));
-  if (!attached) {
-    (wv as any).__abReady = false;
-    return false;
-  }
   if ((wv as any).__abReady) return true;
   const ready = await waitForWebviewEvent(wv, ['dom-ready'], timeoutMs);
   if (ready) {
@@ -743,22 +718,15 @@ const ensureWebviewReady = async (wv: any, timeoutMs = 12000) => {
 const safeExecuteJavaScript = async (wv: any, script: string, timeoutMs = 12000) => {
   if (!wv) return null;
   const ready = await ensureWebviewReady(wv, timeoutMs);
-  if (!ready || !isWebviewConnected(wv)) return null;
+  if (!ready) return null;
   try {
     return await wv.executeJavaScript(script);
   } catch (error) {
     const message = String(error || '');
     if (/dom-ready|attached to the DOM/i.test(message)) {
-      (wv as any).__abReady = false;
       const retryReady = await ensureWebviewReady(wv, timeoutMs);
-      if (!retryReady || !isWebviewConnected(wv)) return null;
-      try {
-        return await wv.executeJavaScript(script);
-      } catch (retryError) {
-        const retryMessage = String(retryError || '');
-        if (/dom-ready|attached to the DOM/i.test(retryMessage)) return null;
-        throw retryError;
-      }
+      if (!retryReady) return null;
+      return await wv.executeJavaScript(script);
     }
     throw error;
   }
@@ -4325,8 +4293,6 @@ ${lines}`
                     setFindActiveMatch(result.activeMatchOrdinal || 0);
                   });
                 }
-              } else {
-                delete webviewsRef.current[t.id];
               }
             }}
             src={t.url}
