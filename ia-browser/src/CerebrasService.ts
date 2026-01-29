@@ -58,13 +58,56 @@ export class CerebrasService {
   async chat(
     message: string,
     systemPrompt?: string,
-    context?: string
+    context?: string,
+    signal?: AbortSignal
   ): Promise<string> {
     if (!this.isConfigured()) {
       throw new Error('Cerebras API key not configured. Please set it in Settings.');
     }
 
     const messages: Array<{ role: string; content: string }> = [];
+    const now = new Date();
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+    const timeStamp = now.toLocaleString('en-US', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+      timeZoneName: 'short'
+    });
+    messages.push({
+      role: 'system',
+      content: `Current date/time: ${timeStamp} (${timeZone}).`
+    });
+
+    const profileRaw = localStorage.getItem('onboardingProfile');
+    if (profileRaw) {
+      try {
+        const profile = JSON.parse(profileRaw) as {
+          name?: string;
+          role?: string;
+          goals?: string;
+          preferences?: string;
+          location?: string;
+        };
+        const parts: string[] = [];
+        if (profile.name) parts.push(`Name: ${profile.name}`);
+        if (profile.location) parts.push(`Location: ${profile.location}`);
+        if (profile.role) parts.push(`Role: ${profile.role}`);
+        if (profile.goals) parts.push(`Goals: ${profile.goals}`);
+        if (profile.preferences) parts.push(`Preferences: ${profile.preferences}`);
+        if (parts.length) {
+          messages.push({
+            role: 'system',
+            content: `User profile: ${parts.join(' | ')}`
+          });
+        }
+      } catch (error) {
+        console.error('Failed to parse onboarding profile:', error);
+      }
+    }
 
     // Add system prompt if provided
     if (systemPrompt) {
@@ -97,7 +140,8 @@ export class CerebrasService {
           max_completion_tokens: this.config.maxTokens,
           clear_thinking: !this.config.disableReasoning,
           disable_reasoning: this.config.disableReasoning
-        })
+        }),
+        signal
       });
 
       if (!response.ok) {
@@ -113,7 +157,7 @@ export class CerebrasService {
     }
   }
 
-  async summarizePage(content: string, url: string, title: string): Promise<string> {
+  async summarizePage(content: string, url: string, title: string, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are an expert at summarizing web pages. 
 You MUST provide concise, accurate summaries that capture the main points.
 Your response should be in English and use Markdown formatting.
@@ -127,10 +171,10 @@ URL: ${url}
 Content:
 ${content.substring(0, 80000)}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async explainLike12(content: string, title: string): Promise<string> {
+  async explainLike12(content: string, title: string, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are an expert at explaining complex topics to a 12-year-old.
 You MUST use simple language, relatable analogies, and clear examples.
 Your response should be in English and use Markdown formatting.
@@ -143,10 +187,10 @@ Title: ${title}
 Content:
 ${content.substring(0, 60000)}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async extractKeyFacts(content: string, title: string): Promise<string> {
+  async extractKeyFacts(content: string, title: string, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are an expert at extracting key information from text.
 You MUST identify the most important facts, statistics, and insights.
 Your response should be in English and use Markdown formatting with bullet points.
@@ -159,10 +203,10 @@ Title: ${title}
 Content:
 ${content.substring(0, 60000)}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async convertToJson(content: string, title: string, url: string): Promise<string> {
+  async convertToJson(content: string, title: string, url: string, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are an expert at structuring unstructured data.
 You MUST convert the content into valid JSON format.
 Your response should ONLY be valid JSON, no other text.
@@ -177,7 +221,7 @@ Content:
 ${content.substring(0, 60000)}`;
 
     try {
-      const response = await this.chat(message, systemPrompt);
+      const response = await this.chat(message, systemPrompt, undefined, signal);
       // Validate JSON
       const parsed = JSON.parse(response);
       return JSON.stringify(parsed, null, 2);
@@ -186,7 +230,7 @@ ${content.substring(0, 60000)}`;
     }
   }
 
-  async turnIntoChecklist(content: string, title: string): Promise<string> {
+  async turnIntoChecklist(content: string, title: string, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are an expert at creating actionable checklists.
 You MUST convert content into clear, actionable checklist items.
 Your response should be in English and use Markdown checkbox format.
@@ -199,10 +243,10 @@ Title: ${title}
 Content:
 ${content.substring(0, 60000)}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async findActionItems(content: string, title: string): Promise<string> {
+  async findActionItems(content: string, title: string, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are an expert at identifying action items in text.
 You MUST find tasks, to-dos, and actionable steps.
 Your response should be in English and use Markdown formatting.
@@ -215,10 +259,26 @@ Title: ${title}
 Content:
 ${content.substring(0, 60000)}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async getRestructuringSuggestions(analysis: PageAnalysis): Promise<string[]> {
+  async composeText(prompt: string, context: string, signal?: AbortSignal): Promise<string> {
+    const systemPrompt = `You are a writing assistant embedded in a browser.
+You draft text the user will insert into the currently focused field.
+Use the provided page context and field details to stay on-topic and consistent with tone.
+Return ONLY the drafted text to insert (no explanations, no markdown fences).
+If you need clarification, ask a single concise question instead of drafting.`;
+
+    const message = `User instruction:
+${prompt}
+
+Context:
+${context}`;
+
+    return await this.chat(message, systemPrompt, undefined, signal);
+  }
+
+  async getRestructuringSuggestions(analysis: PageAnalysis, signal?: AbortSignal): Promise<string[]> {
     const systemPrompt = `You are an expert web designer and UX specialist.
 You MUST provide specific, actionable suggestions for improving web pages.
 Your response should be in English and use bullet points.
@@ -241,14 +301,14 @@ Headings: ${analysis.structure.headings.slice(0, 10).map(h => `H${h.level}: ${h.
 
 Provide 5-7 specific suggestions for improving this page.`;
 
-    const response = await this.chat(message, systemPrompt);
+    const response = await this.chat(message, systemPrompt, undefined, signal);
     // Parse bullet points
     return response.split('\n')
       .filter(line => line.trim().startsWith('-') || line.trim().startsWith('*') || line.trim().startsWith('•'))
       .map(line => '🔹 ' + line.replace(/^[-*•]\s*/, '').trim());
   }
 
-  async chatWithPage(question: string, content: string, title: string): Promise<string> {
+  async chatWithPage(question: string, content: string, title: string, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are a helpful AI assistant answering questions about web pages.
 You MUST provide accurate, helpful responses based on the page content.
 Your response should be in English and use Markdown formatting.
@@ -261,7 +321,7 @@ Page: ${title}
 Content:
 ${content.substring(0, 60000)}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
   async chatWithPageAndSchema(
@@ -270,7 +330,8 @@ ${content.substring(0, 60000)}`;
     title: string,
     pageSchema?: string,
     domSnapshot?: any,
-    userContext?: string
+    userContext?: string,
+    signal?: AbortSignal
   ): Promise<string> {
     const systemPrompt = `You are a helpful AI assistant answering questions about web pages.
 You MUST provide accurate, helpful responses based on the page content.
@@ -293,10 +354,10 @@ ${domText ? `DOM Snapshot (truncated):\n${domText}` : ''}
 
 ${userContext ? `User Context Notes:\n${userContext.substring(0, 8000)}` : ''}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async buildPageSchema(domSnapshot: any): Promise<string> {
+  async buildPageSchema(domSnapshot: any, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are a web automation schema builder.
 You MUST convert the provided DOM snapshot into a compact JSON schema describing the page's interactive elements.
 Return ONLY valid JSON with this shape:
@@ -318,10 +379,10 @@ Keep it compact and prioritize elements a user is likely to interact with.`;
 
 ${snapshotText}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async planPageActions(userRequest: string, pageSchema: string): Promise<string> {
+  async planPageActions(userRequest: string, pageSchema: string, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are a web automation planner.
 Given a user request and a page schema JSON, output ONLY valid JSON in this shape:
 {
@@ -341,7 +402,7 @@ ${userRequest}
 Page schema JSON:
 ${pageSchema.substring(0, 60000)}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
   async planChatBrowsing(
@@ -366,7 +427,8 @@ ${pageSchema.substring(0, 60000)}`;
       planSteps?: string[];
       stepIndex?: number;
       lastActionSummary?: string;
-    }
+    },
+    signal?: AbortSignal
   ): Promise<string> {
     const systemPrompt = `You are an AI browsing copilot.
 You can suggest navigation actions and simple page actions.
@@ -392,14 +454,15 @@ Return ONLY valid JSON with this shape:
   "notes": "optional short notes"
 }
 Rules:
-- Prefer frequent sites when the user's intent matches them.
+- Prefer frequent sites only when the user explicitly asks to use history/shortcuts and the list is non-empty.
 - Use open_url for direct navigation.
 - Use search when the user wants to find something but no site is obvious.
 - Use create_site when the user wants something that doesn't exist or is best served by a custom page/app.
 - Only include page_actions when confident.
-- If the user's goal is to find a person/page/site or move to a different site, prefer navigation/search over page_actions.
+- Never invent direct URLs or handles. Use open_url only when the user provided the URL, it appears in the current page schema, or it is a known base site needed to start navigation.
+- If the user's goal is to find a person/page/site or move to a different site, prefer navigation/search over page_actions unless the target is clearly on the current page.
 - Only use page_actions when the current page is clearly relevant to the goal.
-- If a navigation is needed, include ONLY that navigation action and no page_actions (you will get another turn after load).
+- If navigation to a new site is needed and the current page does not contain relevant actions, include ONLY that navigation action and no page_actions (you will get another turn after load).
 - If the goal appears complete on the current page, return empty actions and explain in response.
 - If no action is needed, return an empty actions array.`;
 
@@ -435,10 +498,10 @@ ${context.memorySummary}
 
 ${context.contextNotesSummary ? `User context notes:\n${context.contextNotesSummary.substring(0, 8000)}` : ''}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async planGoalTask(userRequest: string): Promise<string> {
+  async planGoalTask(userRequest: string, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are a goal and task planner for a browsing agent.
 Return ONLY valid JSON with this shape:
 {
@@ -455,7 +518,7 @@ Rules:
     const message = `User request:
 ${userRequest}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
   async checkGoalCompletion(
@@ -463,7 +526,8 @@ ${userRequest}`;
     userRequest: string,
     page: { url: string; title: string; content: string },
     planSteps?: string[],
-    lastActionSummary?: string
+    lastActionSummary?: string,
+    signal?: AbortSignal
   ): Promise<string> {
     const systemPrompt = `You are a goal completion evaluator for a browsing agent.
 Return ONLY valid JSON with this shape:
@@ -498,10 +562,10 @@ URL: ${page.url}
 Content:
 ${page.content.substring(0, 60000)}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async generateExtension(request: string, domSnapshot: any): Promise<string> {
+  async generateExtension(request: string, domSnapshot: any, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are an expert browser extension generator.
 You MUST output ONLY valid JSON with this shape:
 {
@@ -523,10 +587,10 @@ ${request}
 DOM snapshot:
 ${snapshotText}`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async generateCreation(prompt: string, type: 'webpage' | 'game' | 'app'): Promise<string> {
+  async generateCreation(prompt: string, type: 'webpage' | 'game' | 'app', signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are an expert creative web developer.
 You MUST output ONLY valid JSON with this shape:
 {
@@ -550,10 +614,47 @@ Constraints:
 - Prefer semantic HTML and accessible UI.
 - Include brief in-app instructions if it's a game or interactive app.`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async researchTopic(topic: string): Promise<string> {
+  async refineSkill(skill: {
+    trigger: string;
+    goal?: string;
+    steps: Array<{ type: string; url?: string; inNewTab?: boolean; plan?: any }>;
+  }, signal?: AbortSignal): Promise<string> {
+    const systemPrompt = `You are a skill refinement engine for a browsing assistant.
+Given a specific skill, produce a more generalized yet still specific version of the task.
+Return ONLY valid JSON with this shape:
+{
+  "generalizedTrigger": "short generalized trigger",
+  "generalizedGoal": "short generalized goal",
+  "algorithm": ["step 1", "step 2", "step 3"],
+  "example": "example user request that would use this skill",
+  "tree": [
+    { "id": "1", "parentId": null, "type": "navigate", "label": "Open wikipedia.org", "url": "https://wikipedia.org" },
+    { "id": "1.1", "parentId": "1", "type": "action", "label": "Search for the topic" },
+    { "id": "1.2", "parentId": "1.1", "type": "navigate", "label": "Open the exact article page" }
+  ],
+  "reusableSubpaths": ["search site for topic", "open top result page"],
+  "notes": "short reasoning",
+  "confidence": 0.0
+}
+Rules:
+- Generalize only where safe; keep specific sites or selectors when essential.
+- Ensure the first tree node is the initial navigation to a site.
+- Keep algorithm steps short and actionable.
+- If the skill is not generalizable, keep it specific and state that in notes.
+- Output only JSON, no extra text.`;
+
+    const message = `Skill trigger: ${skill.trigger}
+Goal: ${skill.goal || 'n/a'}
+Steps (JSON):
+${JSON.stringify(skill.steps).substring(0, 120000)}`;
+
+    return await this.chat(message, systemPrompt, undefined, signal);
+  }
+
+  async researchTopic(topic: string, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are a research AI with access to comprehensive knowledge.
 You MUST provide thorough, well-structured research on the given topic.
 Your response should be in English and use Markdown formatting with sections.
@@ -568,10 +669,10 @@ Provide a comprehensive overview including:
 - Benefits and limitations
 - Current state and future trends`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 
-  async getPageRestructuringPlan(analysis: PageAnalysis): Promise<string> {
+  async getPageRestructuringPlan(analysis: PageAnalysis, signal?: AbortSignal): Promise<string> {
     const systemPrompt = `You are an expert at web page restructuring and optimization.
 You MUST provide a detailed, step-by-step restructuring plan.
 Your response should be in English and use numbered steps.
@@ -590,6 +691,6 @@ Analysis:
 
 Provide a step-by-step plan to optimize this page.`;
 
-    return await this.chat(message, systemPrompt);
+    return await this.chat(message, systemPrompt, undefined, signal);
   }
 }

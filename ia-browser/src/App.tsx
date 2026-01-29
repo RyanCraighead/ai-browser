@@ -3,6 +3,7 @@ import { PageCustomizationPanel } from "./PageCustomizationPanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { CerebrasService } from "./CerebrasService";
 import { VisitMemoryService, FrequentSite, VisitEvent } from "./VisitMemoryService";
+import { SkillMemoryService, SkillEntry, SkillStep, SkillRefinement, SkillTreeNode } from "./SkillMemoryService";
 import "./App.css";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -153,6 +154,20 @@ type GoalCheck = {
   question?: string;
   evidence?: string;
   confidence?: number;
+};
+
+type PendingFollowUp = {
+  goalText: string;
+  lastUserMessage: string;
+  lastAssistantMessage: string;
+  planSteps?: string[];
+  successCriteria?: string[];
+  lastActionSummary?: string;
+  url: string;
+  title: string;
+  completed: boolean;
+  askedAt: number;
+  requiresFollowUp: boolean;
 };
 
 const tryParseJson = (raw: string) => {
@@ -493,6 +508,8 @@ const createDataUrl = (html: string) =>
   `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 
 const createHomeUrl = (html: string) => createDataUrl(html);
+const DEFAULT_NEW_TAB_URL = 'about:blank';
+const HOME_DISABLED = true;
 
 const revokeIfBlob = (url?: string | null) => {
   if (url && url.startsWith('blob:')) {
@@ -517,6 +534,23 @@ const sanitizeFileName = (value: string) => {
 };
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const waitForUrlChange = async (wv: any, beforeUrl: string, timeoutMs = 8000) => {
+  if (!wv) return '';
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const current = wv.getURL?.() ?? '';
+    if (current && current !== beforeUrl) return current;
+    await delay(200);
+  }
+  return wv.getURL?.() ?? '';
+};
+
+const actionPlanMayNavigate = (plan: ActionPlan) =>
+  plan.actions.some(action => action.type === 'click' || action.type === 'press' || action.type === 'select');
+
+const isSkillUrl = (url: string) =>
+  url.startsWith('http://') || url.startsWith('https://');
 
 const extractDomainsFromText = (text: string) => {
   const matches = text.toLowerCase().match(/([a-z0-9-]+\.)+[a-z]{2,}/g) || [];
@@ -563,6 +597,43 @@ const extractSearchQueryFromGoal = (text: string) => {
   return cleaned || text.trim();
 };
 
+const isYouTubeHomeUrl = (url: string) => {
+  try {
+    const parsed = new URL(url);
+    if (!parsed.hostname.includes('youtube.com')) return false;
+    return parsed.pathname === '/' || parsed.pathname === '/feed/';
+  } catch {
+    return false;
+  }
+};
+
+const isYouTubeResultsUrl = (url: string) => {
+  try {
+    const parsed = new URL(url);
+    if (!parsed.hostname.includes('youtube.com')) return false;
+    return parsed.pathname === '/results';
+  } catch {
+    return false;
+  }
+};
+
+const pageContainsUrl = (schemaText: string | null, domSnapshot: any, url: string) => {
+  if (!url) return false;
+  const normalized = url.replace(/\/$/, '').toLowerCase();
+  if (schemaText && schemaText.toLowerCase().includes(normalized)) {
+    return true;
+  }
+  if (domSnapshot) {
+    try {
+      const snapshotText = JSON.stringify(domSnapshot).toLowerCase();
+      if (snapshotText.includes(normalized)) return true;
+    } catch {
+      // Ignore snapshot serialization failures.
+    }
+  }
+  return false;
+};
+
 const isDomainRelevantToGoal = (text: string, url: string) => {
   if (!url || url.startsWith('data:') || url.startsWith('about:') || url.startsWith('file:')) {
     return false;
@@ -601,8 +672,16 @@ const isDomainRelevantToGoal = (text: string, url: string) => {
   return keywordHits;
 };
 
+type WebviewWaiter = { cleanup: () => void };
+const webviewWaiters = new WeakMap<any, WebviewWaiter>();
+
 const waitForWebviewEvent = (wv: any, events: string[], timeoutMs = 12000) => {
   if (!wv) return Promise.resolve(false);
+  const existing = webviewWaiters.get(wv);
+  if (existing) {
+    existing.cleanup();
+    webviewWaiters.delete(wv);
+  }
   return new Promise<boolean>((resolve) => {
     let settled = false;
     const handler = () => {
@@ -612,10 +691,11 @@ const waitForWebviewEvent = (wv: any, events: string[], timeoutMs = 12000) => {
       resolve(true);
     };
     const cleanup = () => {
-      events.forEach(eventName => wv.removeEventListener(eventName, handler));
+      events.forEach((eventName) => wv.removeEventListener(eventName, handler));
       clearTimeout(timer);
     };
-    events.forEach(eventName => wv.addEventListener(eventName, handler));
+    webviewWaiters.set(wv, { cleanup });
+    events.forEach((eventName) => wv.addEventListener(eventName, handler, { once: true }));
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
@@ -631,11 +711,11 @@ export default function App() {
   const [homeLinkLabel, setHomeLinkLabel] = useState('');
   const [homeLinkUrl, setHomeLinkUrl] = useState('');
   const [homeLinkIcon, setHomeLinkIcon] = useState('');
-  const [homePageHtml, setHomePageHtml] = useState(() => buildHomeHtml(DEFAULT_HOME_CONFIG, []));
-  const [homePageUrl, setHomePageUrl] = useState(() => createHomeUrl(buildHomeHtml(DEFAULT_HOME_CONFIG, [])));
+  const [homePageHtml, setHomePageHtml] = useState(() => '');
+  const [homePageUrl, setHomePageUrl] = useState(() => DEFAULT_NEW_TAB_URL);
 
   const [tabs, setTabs] = useState<Tab[]>([
-    { id: "tab-1", title: DEFAULT_HOME_CONFIG.title || "Home", url: homePageUrl, isHome: true },
+    { id: "tab-1", title: "New Tab", url: homePageUrl, isHome: true },
   ]);
   const [activeId, setActiveId] = useState("tab-1");
   const [omnibox, setOmnibox] = useState(homePageUrl);
@@ -643,6 +723,30 @@ export default function App() {
   const [aiSidebarOpen, setAiSidebarOpen] = useState(false);
   const [aiResult, setAiResult] = useState<string>("");
   const [isLoading, setIsLoading] = useState(false);
+  const [aiActionDepth, setAiActionDepth] = useState(0);
+  const chatPreviewRef = useRef<HTMLDivElement | null>(null);
+  const [chatPreviewScale, setChatPreviewScale] = useState(0.5);
+  const [chatPreviewExpanded, setChatPreviewExpanded] = useState(false);
+  const [chatPreviewPinned, setChatPreviewPinned] = useState(false);
+  const [completedTabInfo, setCompletedTabInfo] = useState<{
+    id: string;
+    url: string;
+    title: string;
+  } | null>(null);
+  const [composePanelOpen, setComposePanelOpen] = useState(false);
+  const [composePrompt, setComposePrompt] = useState('');
+  const [composeResult, setComposeResult] = useState('');
+  const [composeLoading, setComposeLoading] = useState(false);
+  const [composeError, setComposeError] = useState<string | null>(null);
+  const [composeUseFullContext, setComposeUseFullContext] = useState(true);
+  const [composeActiveField, setComposeActiveField] = useState<{
+    label: string;
+    selector?: string;
+    type?: string;
+    valuePreview?: string;
+  } | null>(null);
+  const pendingFollowUpRef = useRef<PendingFollowUp | null>(null);
+  const aiAbortRef = useRef<AbortController | null>(null);
   const [messages, setMessages] = useState<Array<{
     id?: string;
     role: 'user' | 'assistant' | 'system';
@@ -656,9 +760,11 @@ export default function App() {
   const [chatAutoOpenEnabled, setChatAutoOpenEnabled] = useState(() => localStorage.getItem('chatAutoOpenEnabled') !== 'false');
   const [frequentSites, setFrequentSites] = useState<FrequentSite[]>([]);
   const [recentVisits, setRecentVisits] = useState<VisitEvent[]>([]);
-  const [browserMode, setBrowserMode] = useState<'classic' | 'chat'>(() =>
-    localStorage.getItem('browserMode') === 'chat' ? 'chat' : 'classic'
-  );
+  const [browserMode, setBrowserMode] = useState<'classic' | 'chat'>(() => {
+    const saved = localStorage.getItem('browserMode');
+    if (saved === 'classic' || saved === 'chat') return saved;
+    return 'chat';
+  });
   // Memory page is handled via memoryPanelOpen
   const [bookmarksBarVisible, setBookmarksBarVisible] = useState(() =>
     localStorage.getItem('bookmarksBarVisible') !== 'false'
@@ -741,10 +847,21 @@ export default function App() {
   const [extensionPrompt, setExtensionPrompt] = useState("");
   const [extensionStatus, setExtensionStatus] = useState<'idle' | 'generating' | 'error' | 'ready'>('idle');
 
+  const [onboardingOpen, setOnboardingOpen] = useState(() =>
+    localStorage.getItem('onboardingCompleted') !== 'true'
+  );
+  const [onboardingName, setOnboardingName] = useState('');
+  const [onboardingRole, setOnboardingRole] = useState('');
+  const [onboardingGoals, setOnboardingGoals] = useState('');
+  const [onboardingPreferences, setOnboardingPreferences] = useState('');
+  const [onboardingLocation, setOnboardingLocation] = useState('');
+
   const [contextNotes, setContextNotes] = useState<ContextNote[]>([]);
   const [contextTitle, setContextTitle] = useState("");
   const [contextContent, setContextContent] = useState("");
   const [editingContextId, setEditingContextId] = useState<string | null>(null);
+  const [skills, setSkills] = useState<SkillEntry[]>([]);
+  const [expandedSkills, setExpandedSkills] = useState<Record<string, boolean>>({});
 
   const toggleActionLog = (id: string) => {
     setExpandedActionLogs(prev => ({ ...prev, [id]: !prev[id] }));
@@ -754,9 +871,28 @@ export default function App() {
     setExpandedExtensions(prev => ({ ...prev, [id]: !prev[id] }));
   };
 
+  const refreshSkillData = () => {
+    setSkills(skillMemoryService.getSkills());
+  };
+
+  const toggleSkillDetails = (id: string) => {
+    setExpandedSkills(prev => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const deleteSkill = (id: string) => {
+    skillMemoryService.deleteSkill(id);
+    setExpandedSkills(prev => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    refreshSkillData();
+  };
+
   // Cerebras service
   const cerebrasService = CerebrasService.getInstance();
   const visitMemoryService = useMemo(() => VisitMemoryService.getInstance(), []);
+  const skillMemoryService = useMemo(() => SkillMemoryService.getInstance(), []);
 
   const webviewsRef = useRef<Record<string, any>>({});
   const webviewContainerRef = useRef<HTMLDivElement>(null);
@@ -766,9 +902,18 @@ export default function App() {
   const homeUrlRef = useRef<string | null>(null);
   const activeIdRef = useRef(activeId);
   const tabsRef = useRef(tabs);
+  const skillRefineInFlightRef = useRef<Set<string>>(new Set());
 
   const activeTab = useMemo(() => tabs.find(t => t.id === activeId)!, [tabs, activeId]);
   const isChatBrowser = browserMode === 'chat';
+
+  const skillCaptureRef = useRef<{
+    trigger: string;
+    signature: string;
+    goal?: string;
+    steps: SkillStep[];
+  } | null>(null);
+  const skillReplayRef = useRef(false);
 
   useEffect(() => {
     extensionsRef.current = extensions;
@@ -808,6 +953,17 @@ export default function App() {
   }, [visitMemoryService]);
 
   useEffect(() => {
+    setSkills(skillMemoryService.getSkills());
+  }, [skillMemoryService]);
+
+  useEffect(() => {
+    if (memoryPanelOpen) {
+      setSkills(skillMemoryService.getSkills());
+    }
+  }, [memoryPanelOpen, skillMemoryService]);
+
+  useEffect(() => {
+    if (HOME_DISABLED) return;
     const html = buildHomeHtml(homeConfig, bookmarks);
     setHomePageHtml(html);
     const url = createHomeUrl(html);
@@ -843,6 +999,62 @@ export default function App() {
       setSchemaStatus('idle');
     }
   }, [activeTab.url, pageSchemaUrl]);
+
+  useEffect(() => {
+    const container = chatPreviewRef.current;
+    if (!container) return;
+    const baseWidth = 1280;
+    const baseHeight = 720;
+    const updateScale = () => {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (!width || !height) return;
+      const next = Math.min(width / baseWidth, height / baseHeight);
+      setChatPreviewScale(prev => (Math.abs(prev - next) >= 0.01 ? next : prev));
+    };
+    updateScale();
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updateScale);
+      return () => window.removeEventListener('resize', updateScale);
+    }
+    const observer = new ResizeObserver(updateScale);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [chatPreviewExpanded]);
+
+  useEffect(() => {
+    if (chatPreviewPinned && !chatPreviewExpanded) {
+      setChatPreviewExpanded(true);
+    }
+  }, [chatPreviewPinned, chatPreviewExpanded]);
+
+  useEffect(() => {
+    if (!composePanelOpen) return;
+    let cancelled = false;
+    (async () => {
+      const context = await getActiveFieldContext();
+      if (cancelled) return;
+      const active = context?.active;
+      if (active) {
+        const label = active.label
+          || active.placeholder
+          || active.name
+          || active.id
+          || `${active.tag}${active.type ? `:${active.type}` : ''}`;
+        setComposeActiveField({
+          label,
+          selector: active.selector,
+          type: active.type,
+          valuePreview: active.valuePreview
+        });
+      } else {
+        setComposeActiveField(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [composePanelOpen, activeId]);
 
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
@@ -1005,8 +1217,8 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const getHomeUrl = () => homeUrlRef.current || homePageUrl;
-  const getHomeTitle = () => (homeConfig.title?.trim() ? homeConfig.title.trim() : 'Home');
+  const getHomeUrl = () => DEFAULT_NEW_TAB_URL;
+  const getHomeTitle = () => 'New Tab';
   const createHomeTab = (id?: string): Tab => ({
     id: id || `tab-${crypto.randomUUID()}`,
     title: getHomeTitle(),
@@ -1128,6 +1340,25 @@ export default function App() {
     setTabs(prev => [...prev, t]);
     setActiveId(t.id);
     setOmnibox(t.url);
+  };
+
+  const addCompletedTabToTop = () => {
+    if (!completedTabInfo?.url) return;
+    const { id, url, title } = completedTabInfo;
+    const isHome = url === getHomeUrl();
+    const existing = tabsRef.current.find(t => t.id === id);
+    const nextId = existing ? id : `tab-${crypto.randomUUID()}`;
+    const nextTitle = title || existing?.title || titleFromUrl(url);
+
+    setTabs(prev => {
+      const rest = prev.filter(t => t.id !== id);
+      const nextTab = existing
+        ? { ...existing, url, title: nextTitle, isHome }
+        : { id: nextId, title: nextTitle, url, isHome };
+      return [nextTab, ...rest];
+    });
+    setActiveId(nextId);
+    setOmnibox(url);
   };
 
   const closeTab = (id: string) => {
@@ -1400,15 +1631,567 @@ export default function App() {
     };
   };
 
+  const parseSkillRefinement = (raw: string): SkillRefinement | null => {
+    const parsed = extractJsonPayload(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const generalizedTrigger =
+      typeof (parsed as any).generalizedTrigger === 'string'
+        ? (parsed as any).generalizedTrigger.trim()
+        : '';
+    const generalizedGoal =
+      typeof (parsed as any).generalizedGoal === 'string'
+        ? (parsed as any).generalizedGoal.trim()
+        : undefined;
+    const example =
+      typeof (parsed as any).example === 'string'
+        ? (parsed as any).example.trim()
+        : undefined;
+    const notes =
+      typeof (parsed as any).notes === 'string'
+        ? (parsed as any).notes.trim()
+        : undefined;
+    const confidence =
+      typeof (parsed as any).confidence === 'number'
+        ? (parsed as any).confidence
+        : undefined;
+    const algorithmRaw = Array.isArray((parsed as any).algorithm) ? (parsed as any).algorithm : [];
+    const algorithm = algorithmRaw
+      .filter((step: unknown) => typeof step === 'string')
+      .map((step: string) => step.trim())
+      .filter(Boolean);
+    const reusableRaw = Array.isArray((parsed as any).reusableSubpaths) ? (parsed as any).reusableSubpaths : [];
+    const reusableSubpaths = reusableRaw
+      .filter((item: unknown) => typeof item === 'string')
+      .map((item: string) => item.trim())
+      .filter(Boolean);
+    const treeRaw = Array.isArray((parsed as any).tree) ? (parsed as any).tree : [];
+    const tree = treeRaw
+      .filter((node: any) => node && typeof node === 'object' && typeof node.id === 'string' && typeof node.label === 'string')
+      .map((node: any): SkillTreeNode => ({
+        id: node.id,
+        parentId: typeof node.parentId === 'string' || node.parentId === null ? node.parentId : undefined,
+        type: node.type === 'navigate' || node.type === 'action' || node.type === 'decision' || node.type === 'note'
+          ? node.type
+          : 'action',
+        label: String(node.label || '').trim(),
+        url: typeof node.url === 'string' ? node.url : undefined,
+        selector: typeof node.selector === 'string' ? node.selector : undefined,
+        notes: typeof node.notes === 'string' ? node.notes : undefined
+      }))
+      .filter((node) => node.id && node.label);
+
+    if (!generalizedTrigger && algorithm.length === 0 && tree.length === 0) return null;
+    return {
+      generalizedTrigger: generalizedTrigger || '',
+      generalizedGoal: generalizedGoal || undefined,
+      algorithm,
+      example,
+      tree: tree.length ? tree : undefined,
+      reusableSubpaths: reusableSubpaths.length ? reusableSubpaths : undefined,
+      notes,
+      confidence,
+      refinedAt: Date.now()
+    };
+  };
+
+  const beginSkillCapture = (trigger: string) => {
+    if (!chatModeEnabled || !cerebrasService.isConfigured()) return;
+    if (skillReplayRef.current) return;
+    const signature = skillMemoryService.getSignature(trigger);
+    if (!signature) return;
+    skillCaptureRef.current = {
+      trigger,
+      signature,
+      steps: []
+    };
+  };
+
+  const updateSkillGoal = (goal: string) => {
+    if (!skillCaptureRef.current) return;
+    skillCaptureRef.current.goal = goal;
+  };
+
+  const recordSkillStep = (step: SkillStep) => {
+    if (!skillCaptureRef.current || skillReplayRef.current) return;
+    if (step.type === 'open_url' && (!step.url || !isSkillUrl(step.url))) return;
+    skillCaptureRef.current.steps.push(step);
+  };
+
+  const recordSkillNavigation = (url: string, inNewTab = false) => {
+    if (!url) return;
+    recordSkillStep({ type: 'open_url', url, inNewTab });
+  };
+
+  const finalizeSkillCapture = (success: boolean) => {
+    const capture = skillCaptureRef.current;
+    if (!capture) return;
+    skillCaptureRef.current = null;
+    if (!success || !capture.steps.length) return;
+    const savedSkill = skillMemoryService.saveSkill(capture);
+    refreshSkillData();
+    if (savedSkill) {
+      maybeRefineSkill(savedSkill);
+    }
+  };
+
+  const maybeRefineSkill = async (skill: SkillEntry) => {
+    if (!cerebrasService.isConfigured()) return;
+    if (skill.refinement?.refinedAt) return;
+    const totalSkills = skillMemoryService.getSkills().length;
+    if (totalSkills % 5 !== 0) return;
+    if (skillRefineInFlightRef.current.has(skill.id)) return;
+    skillRefineInFlightRef.current.add(skill.id);
+    try {
+      const raw = await cerebrasService.refineSkill(skill);
+      const refinement = parseSkillRefinement(raw);
+      if (refinement) {
+        skillMemoryService.updateSkill(skill.id, { refinement });
+        refreshSkillData();
+      }
+    } catch (error) {
+      console.error('Skill refinement failed:', error);
+    } finally {
+      skillRefineInFlightRef.current.delete(skill.id);
+    }
+  };
+
+  const markChatTaskComplete = () => {
+    const wv = getActiveWebview();
+    const url = wv?.getURL?.() ?? activeTab.url;
+    if (!url) return;
+    const title = activeTab.title || titleFromUrl(url);
+    setCompletedTabInfo({
+      id: activeIdRef.current,
+      url,
+      title
+    });
+  };
+
+  const getLastAssistantMessage = (list: Array<{ role: 'user' | 'assistant' | 'system'; content: string; kind?: 'action-log' }>) => {
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const msg = list[i];
+      if (msg.role === 'assistant' && msg.kind !== 'action-log' && msg.content) {
+        return msg.content;
+      }
+    }
+    return '';
+  };
+
+  const assistantRequestsContinuation = (message: string) => {
+    const trimmed = message.trim();
+    if (!trimmed) return false;
+    if (trimmed.includes('?')) return true;
+    return /\b(do you want|would you like|want me to|should i|shall i|keep going|continue|next step|click on|open any|go ahead|anything else)\b/i.test(trimmed);
+  };
+
+  const storePendingFollowUp = (opts: {
+    goalText: string;
+    userMessage: string;
+    assistantMessage: string;
+    goalPlan?: GoalPlan | null;
+    lastActionSummary?: string;
+    completed?: boolean;
+    force?: boolean;
+  }) => {
+    const wv = getActiveWebview();
+    const url = wv?.getURL?.() ?? activeTab.url;
+    const title = activeTab.title || (url ? titleFromUrl(url) : 'Untitled');
+    const assistantMessage = opts.assistantMessage?.trim() || '';
+    const requiresFollowUp = Boolean(opts.force) || assistantRequestsContinuation(assistantMessage);
+    pendingFollowUpRef.current = {
+      goalText: opts.goalText || opts.userMessage,
+      lastUserMessage: opts.userMessage,
+      lastAssistantMessage: assistantMessage,
+      planSteps: opts.goalPlan?.steps?.length ? opts.goalPlan.steps : undefined,
+      successCriteria: opts.goalPlan?.successCriteria,
+      lastActionSummary: opts.lastActionSummary,
+      url,
+      title,
+      completed: Boolean(opts.completed),
+      askedAt: Date.now(),
+      requiresFollowUp
+    };
+  };
+
+  const buildFollowUpPrompt = (userReply: string, context: PendingFollowUp) => {
+    const assistantSnippet = context.lastAssistantMessage.length > 600
+      ? `${context.lastAssistantMessage.slice(0, 600)}...`
+      : context.lastAssistantMessage;
+    const lines = [
+      'Continue the previous task.',
+      context.goalText ? `Previous goal: ${context.goalText}` : '',
+      assistantSnippet ? `Assistant said: ${assistantSnippet}` : '',
+      context.lastActionSummary ? `Progress so far: ${context.lastActionSummary}` : '',
+      `User reply: ${userReply}`
+    ].filter(Boolean);
+    return lines.join('\n');
+  };
+
+  const getActiveFieldContext = async () => {
+    const wv = getActiveWebview();
+    if (!wv) return null;
+    try {
+      return await wv.executeJavaScript(`
+        (() => {
+          const trimText = (text, max = 240) => {
+            if (!text) return '';
+            return text.replace(/\\s+/g, ' ').trim().slice(0, max);
+          };
+          const escapeCss = (value) => {
+            if (window.CSS && CSS.escape) return CSS.escape(value);
+            return value.replace(/[^a-zA-Z0-9_-]/g, '\\\\$&');
+          };
+          const selectorFor = (el) => {
+            if (!el || el.nodeType !== 1) return '';
+            if (el.id) return '#' + escapeCss(el.id);
+            const parts = [];
+            let node = el;
+            while (node && node.nodeType === 1 && parts.length < 4) {
+              let part = node.tagName.toLowerCase();
+              if (node.className && typeof node.className === 'string') {
+                const classes = node.className.split(/\\s+/).filter(Boolean).slice(0, 2);
+                if (classes.length) {
+                  part += '.' + classes.map(escapeCss).join('.');
+                }
+              }
+              const parent = node.parentElement;
+              if (parent) {
+                const siblings = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+                if (siblings.length > 1) {
+                  const index = siblings.indexOf(node) + 1;
+                  part += ':nth-of-type(' + index + ')';
+                }
+              }
+              parts.unshift(part);
+              node = node.parentElement;
+            }
+            return parts.join(' > ');
+          };
+          const getLabelText = (el) => {
+            if (!el || el.nodeType !== 1) return '';
+            const ariaLabel = el.getAttribute('aria-label');
+            if (ariaLabel) return trimText(ariaLabel, 160);
+            const labelledBy = el.getAttribute('aria-labelledby');
+            if (labelledBy) {
+              const labels = labelledBy.split(/\\s+/).map((id) => document.getElementById(id)).filter(Boolean);
+              const labelText = labels.map((node) => node?.innerText || '').join(' ');
+              if (labelText.trim()) return trimText(labelText, 160);
+            }
+            if (el.id) {
+              const label = document.querySelector('label[for="' + escapeCss(el.id) + '"]');
+              if (label?.innerText) return trimText(label.innerText, 160);
+            }
+            const parentLabel = el.closest?.('label');
+            if (parentLabel?.innerText) return trimText(parentLabel.innerText, 160);
+            return '';
+          };
+
+          const el = document.activeElement;
+          if (!el || el === document.body || el === document.documentElement) {
+            return { active: null };
+          }
+          const tag = el.tagName?.toLowerCase?.() || '';
+          const type = el.getAttribute?.('type') || '';
+          const role = el.getAttribute?.('role') || '';
+          const placeholder = el.getAttribute?.('placeholder') || '';
+          const name = el.getAttribute?.('name') || '';
+          const id = el.id || '';
+          const isContentEditable = Boolean(el.isContentEditable);
+          const value = 'value' in el ? String(el.value || '') : (el.textContent || '');
+          const selectionStart = typeof el.selectionStart === 'number' ? el.selectionStart : null;
+          const selectionEnd = typeof el.selectionEnd === 'number' ? el.selectionEnd : null;
+          let selectedText = '';
+          if (isContentEditable && window.getSelection) {
+            selectedText = window.getSelection().toString();
+          } else if (selectionStart !== null && selectionEnd !== null && value) {
+            selectedText = value.substring(selectionStart, selectionEnd);
+          }
+          const rect = el.getBoundingClientRect();
+          const container = el.closest?.('form, article, section, main, aside, div');
+          const containerText = container ? trimText(container.innerText || '', 800) : '';
+          return {
+            active: {
+              tag,
+              type,
+              role,
+              name,
+              id,
+              placeholder,
+              label: getLabelText(el),
+              selector: selectorFor(el),
+              valuePreview: trimText(value, 400),
+              selectedText: trimText(selectedText, 240),
+              selectionStart,
+              selectionEnd,
+              isContentEditable,
+              rect: {
+                top: Math.round(rect.top),
+                left: Math.round(rect.left),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height)
+              },
+              containerText
+            }
+          };
+        })()
+      `);
+    } catch (error) {
+      console.error('Failed to read active field context:', error);
+      return null;
+    }
+  };
+
+  const getVisiblePageText = async () => {
+    const wv = getActiveWebview();
+    if (!wv) return '';
+    try {
+      const payload = await wv.executeJavaScript(`
+        (() => {
+          const trimText = (text, max = 240) => {
+            if (!text) return '';
+            return text.replace(/\\s+/g, ' ').trim().slice(0, max);
+          };
+          const isVisible = (el) => {
+            if (!el || el.nodeType !== 1) return false;
+            const style = window.getComputedStyle(el);
+            if (!style || style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
+          };
+          const candidates = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,code,article,section,div,span'));
+          const seen = new Set();
+          const lines = [];
+          for (const el of candidates) {
+            if (!isVisible(el)) continue;
+            const text = trimText(el.innerText || '');
+            if (!text || text.length < 24) continue;
+            if (seen.has(text)) continue;
+            seen.add(text);
+            lines.push(text);
+            if (lines.join('\\n').length > 12000) break;
+          }
+          return lines.join('\\n');
+        })()
+      `);
+      return typeof payload === 'string' ? payload : '';
+    } catch (error) {
+      console.error('Failed to capture visible text:', error);
+      return '';
+    }
+  };
+
+  const buildComposeContext = async (useFullContext: boolean) => {
+    const activeContext = await getActiveFieldContext();
+    const active = activeContext?.active || null;
+    const page = await getPageContent();
+    const url = page.url || activeTab.url;
+    const title = page.title || activeTab.title || 'Untitled';
+    const visibleText = await getVisiblePageText();
+    const pageText = useFullContext ? page.content : visibleText;
+
+    return {
+      url,
+      title,
+      active,
+      pageText,
+      visibleText
+    };
+  };
+
+  const handleComposeGenerate = async (overridePrompt?: string) => {
+    const prompt = (overridePrompt ?? composePrompt).trim();
+    if (!prompt) return;
+    if (!cerebrasService.isConfigured()) {
+      setComposeError('Set your Cerebras API key in Settings to use compose mode.');
+      return;
+    }
+    setComposeError(null);
+    setComposeLoading(true);
+    try {
+      const context = await buildComposeContext(composeUseFullContext);
+      const activeLabel = context.active?.label
+        || context.active?.placeholder
+        || context.active?.name
+        || context.active?.id
+        || (context.active?.tag ? `${context.active.tag}${context.active.type ? `:${context.active.type}` : ''}` : 'No active field');
+      setComposeActiveField({
+        label: activeLabel,
+        selector: context.active?.selector,
+        type: context.active?.type,
+        valuePreview: context.active?.valuePreview
+      });
+
+      const activeInfo = context.active
+        ? `Active field:
+- tag: ${context.active.tag}
+- type: ${context.active.type || 'n/a'}
+- role: ${context.active.role || 'n/a'}
+- label: ${context.active.label || 'n/a'}
+- placeholder: ${context.active.placeholder || 'n/a'}
+- name: ${context.active.name || 'n/a'}
+- id: ${context.active.id || 'n/a'}
+- selector: ${context.active.selector || 'n/a'}
+- value preview: ${context.active.valuePreview || 'n/a'}
+- selected text: ${context.active.selectedText || 'n/a'}
+- selection: ${context.active.selectionStart ?? 'n/a'}-${context.active.selectionEnd ?? 'n/a'}
+- content editable: ${context.active.isContentEditable ? 'yes' : 'no'}
+${context.active.containerText ? `- nearby text: ${context.active.containerText}` : ''}`
+        : 'Active field: none';
+
+      const contextText = [
+        `Page: ${context.title}`,
+        `URL: ${context.url}`,
+        activeInfo,
+        composeUseFullContext
+          ? `Full page text (truncated):\n${context.pageText.substring(0, 60000)}`
+          : `Visible page text (no scrolling):\n${context.pageText.substring(0, 12000)}`
+      ].join('\n\n');
+
+      const response = await cerebrasService.composeText(
+        prompt,
+        contextText,
+        undefined
+      );
+      setComposeResult(response.trim());
+    } catch (error) {
+      console.error('Compose failed:', error);
+      const message = error instanceof Error ? error.message : 'Failed to generate text.';
+      setComposeError(message);
+    } finally {
+      setComposeLoading(false);
+    }
+  };
+
+  const handleComposeGenerateWithPrompt = async (prompt: string) => {
+    const next = prompt.trim();
+    if (!next) return;
+    setComposePrompt(next);
+    await handleComposeGenerate(next);
+  };
+
+  const stripComposePrefix = (message: string) => message.replace(/^\s*\/(compose|draft|reply)\b\s*/i, '').trim();
+
+  const isComposeIntent = (message: string) => {
+    if (/^\s*\/(compose|draft|reply)\b/i.test(message)) return true;
+    return /\b(compose|draft|reply|respond|rewrite|rephrase|polish|fix grammar|edit this|improve this|shorten|lengthen)\b/i.test(message);
+  };
+
+  const insertComposeResult = async () => {
+    const wv = getActiveWebview();
+    if (!wv || !composeResult.trim()) return;
+    try {
+      const inserted = await wv.executeJavaScript(`
+        (() => {
+          const el = document.activeElement;
+          if (!el || el === document.body || el === document.documentElement) return false;
+          const text = ${JSON.stringify(composeResult)};
+          if ('value' in el) {
+            const start = typeof el.selectionStart === 'number' ? el.selectionStart : el.value.length;
+            const end = typeof el.selectionEnd === 'number' ? el.selectionEnd : el.value.length;
+            const before = el.value.slice(0, start);
+            const after = el.value.slice(end);
+            el.value = before + text + after;
+            const nextPos = before.length + text.length;
+            if (typeof el.setSelectionRange === 'function') {
+              el.setSelectionRange(nextPos, nextPos);
+            }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          }
+          if (el.isContentEditable) {
+            document.execCommand('insertText', false, text);
+            return true;
+          }
+          return false;
+        })()
+      `);
+      if (!inserted) {
+        setComposeError('Click into a text field on the page before inserting.');
+      }
+    } catch (error) {
+      console.error('Failed to insert compose result:', error);
+      setComposeError('Unable to insert text into the active field.');
+    }
+  };
+
+  const shouldTreatAsFollowUp = (message: string, pending: PendingFollowUp | null, lastAssistantMessage: string) => {
+    if (!pending) return false;
+    if (Date.now() - pending.askedAt > 10 * 60 * 1000) return false;
+    const trimmed = message.trim();
+    if (!trimmed) return false;
+    const assistantText = lastAssistantMessage || pending.lastAssistantMessage;
+    const assistantAsked = pending.requiresFollowUp || assistantRequestsContinuation(assistantText);
+    if (!assistantAsked) return false;
+    if (/^(find|search|look up|show me|what is|who is|tell me|summarize|explain|create|generate|build|make|write)\b/i.test(trimmed)) {
+      return false;
+    }
+    const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+    const isShort = wordCount <= 12;
+    const looksLikeFollowUpReply = /^(yes|yeah|yep|sure|ok|okay|please|go ahead|do it|continue|next)\b/i.test(trimmed);
+    const mentionsAction = /\b(click|open|select|choose|tap|press|scroll|type|enter|fill)\b/i.test(trimmed);
+    const hasReferential = /\b(this|that|these|those|one|first|second|third|above|previous|same)\b/i.test(trimmed);
+    return (isShort || looksLikeFollowUpReply || mentionsAction) && (looksLikeFollowUpReply || mentionsAction || hasReferential || isShort);
+  };
+
+  const replaySkill = async (skill: SkillEntry, signal: AbortSignal) => {
+    const ensureNotAborted = () => {
+      if (signal.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+    };
+
+    for (const step of skill.steps) {
+      ensureNotAborted();
+      if (step.type === 'open_url') {
+        const target = navigateTo(step.url, step.inNewTab);
+        if (target) {
+          setMessages(prev => [...prev, { role: 'assistant', content: `Navigating to ${target}` }]);
+          await delay(300);
+          await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+        }
+        continue;
+      }
+
+      if (step.type === 'page_actions' && step.plan) {
+        const wv = getActiveWebview();
+        const beforeUrl = wv?.getURL?.() ?? '';
+        const { executed, attempted, results } = await executeActionPlan(step.plan);
+        if (attempted > 0) {
+          const logId = crypto.randomUUID();
+          setMessages(prev => [
+            ...prev,
+            {
+              id: logId,
+              role: 'assistant',
+              content: `Executed ${executed}/${attempted} page action(s).`,
+              kind: 'action-log',
+              actions: results,
+              summary: `Executed ${executed}/${attempted} page action(s).`
+            }
+          ]);
+        }
+        if (actionPlanMayNavigate(step.plan)) {
+          await Promise.all([
+            waitForWebviewEvent(wv, ['did-navigate', 'did-navigate-in-page', 'did-stop-loading', 'dom-ready'], 9000),
+            waitForUrlChange(wv, beforeUrl, 9000)
+          ]);
+        }
+      }
+    }
+  };
+
   const executeActionPlan = async (plan: ActionPlan) => {
     const wv = webviewsRef.current[activeId];
     if (!wv) return { executed: 0, attempted: 0 };
 
     try {
+      setAiActionDepth(prev => prev + 1);
       const results = await wv.executeJavaScript(`
-        (() => {
+        (async () => {
           const plan = ${JSON.stringify(plan)};
           const results = [];
+          const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
           const resolveEl = (selector) => {
             if (!selector) return null;
             try {
@@ -1417,7 +2200,39 @@ export default function App() {
               return null;
             }
           };
+          const resolvePressTarget = (selector) => resolveEl(selector) || document.activeElement;
           const dispatch = (el, type) => el && el.dispatchEvent(new Event(type, { bubbles: true }));
+          const dispatchKey = (el, type, key) => {
+            const isEnter = key === 'Enter';
+            const keyCode = isEnter ? 13 : 0;
+            el.dispatchEvent(new KeyboardEvent(type, {
+              key,
+              code: isEnter ? 'Enter' : undefined,
+              keyCode,
+              which: keyCode,
+              bubbles: true,
+              cancelable: true,
+              composed: true
+            }));
+          };
+          const attemptFormSubmit = (el) => {
+            if (!el) return false;
+            const form = el.form || el.closest?.('form');
+            if (!form) return false;
+            const submitEvent = new Event('submit', { bubbles: true, cancelable: true });
+            const shouldSubmit = form.dispatchEvent(submitEvent);
+            if (shouldSubmit) {
+              if (typeof form.requestSubmit === 'function') {
+                form.requestSubmit();
+              } else if (typeof form.submit === 'function') {
+                form.submit();
+              } else {
+                const btn = form.querySelector('button[type="submit"], input[type="submit"]');
+                btn?.click?.();
+              }
+            }
+            return true;
+          };
 
           for (const action of plan.actions || []) {
             let status = 'skipped';
@@ -1463,11 +2278,16 @@ export default function App() {
                 status = 'not_found';
               }
             } else if (action.type === 'press') {
-              const el = resolveEl(selector);
+              const el = resolvePressTarget(selector);
               if (el) {
                 const key = action.key || 'Enter';
-                el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
-                el.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
+                el.focus?.();
+                dispatchKey(el, 'keydown', key);
+                dispatchKey(el, 'keypress', key);
+                dispatchKey(el, 'keyup', key);
+                if (key === 'Enter') {
+                  attemptFormSubmit(el);
+                }
                 status = 'ok';
               } else {
                 status = 'not_found';
@@ -1482,6 +2302,7 @@ export default function App() {
               }
             }
             results.push({ action, status });
+            await delay(60);
           }
           return results;
         })()
@@ -1491,10 +2312,15 @@ export default function App() {
         ? results.filter((entry) => entry.status === 'ok').length
         : 0;
       const attempted = Array.isArray(results) ? results.length : 0;
+      if (attempted > 0) {
+        recordSkillStep({ type: 'page_actions', plan });
+      }
       return { executed, attempted, results: Array.isArray(results) ? results : [] };
     } catch (error) {
       console.error('Failed to execute action plan:', error);
       return { executed: 0, attempted: 0, results: [] };
+    } finally {
+      setAiActionDepth(prev => Math.max(0, prev - 1));
     }
   };
 
@@ -1817,6 +2643,8 @@ ${editingHtml.substring(0, 80000)}`;
   };
 
   const handleAIFeature = async (feature: AIFeature) => {
+    const controller = beginAiRequest();
+    const { signal } = controller;
     setIsLoading(true);
     setAiResult("");
 
@@ -1828,30 +2656,30 @@ ${editingHtml.substring(0, 80000)}`;
 
       switch (feature.id) {
         case "summarize":
-          response = await cerebrasService.summarizePage(content, url, title);
+          response = await cerebrasService.summarizePage(content, url, title, signal);
 
           setMessages(prev => [...prev, { role: 'assistant', content: response }]);
           break;
         case "explain-simple":
-          response = await cerebrasService.explainLike12(content, title);
+          response = await cerebrasService.explainLike12(content, title, signal);
           setMessages(prev => [...prev, { role: 'assistant', content: response }]);
           break;
         case "key-facts":
-          response = await cerebrasService.extractKeyFacts(content, title);
+          response = await cerebrasService.extractKeyFacts(content, title, signal);
           setMessages(prev => [...prev, { role: 'assistant', content: response }]);
           break;
         case "to-json":
-          response = await cerebrasService.convertToJson(content, title, url);
+          response = await cerebrasService.convertToJson(content, title, url, signal);
           setJsonOutput(response);
           setJsonPanelOpen(true);
           setMessages(prev => [...prev, { role: 'assistant', content: response }]);
           break;
         case "checklist":
-          response = await cerebrasService.turnIntoChecklist(content, title);
+          response = await cerebrasService.turnIntoChecklist(content, title, signal);
           setMessages(prev => [...prev, { role: 'assistant', content: response }]);
           break;
         case "action-items":
-          response = await cerebrasService.findActionItems(content, title);
+          response = await cerebrasService.findActionItems(content, title, signal);
           setMessages(prev => [...prev, { role: 'assistant', content: response }]);
           break;
         default:
@@ -1860,16 +2688,23 @@ ${editingHtml.substring(0, 80000)}`;
 
       setAiResult(response);
     } catch (error: any) {
+      if (signal.aborted || error?.name === 'AbortError') {
+        return;
+      }
       const errorMsg = error.message || "An error occurred";
       setMessages(prev => [...prev, { role: 'assistant', content: `❌ Error: ${errorMsg}` }]);
+    } finally {
+      finalizeSkillCapture(false);
+      clearAiRequest(controller);
+      setIsLoading(false);
     }
-
-    setIsLoading(false);
   };
 
 
 
   const handleQuickSummarize = async () => {
+    const controller = beginAiRequest();
+    const { signal } = controller;
     setAiSidebarOpen(true);
     setIsLoading(true);
     setMessages([]);
@@ -1878,56 +2713,150 @@ ${editingHtml.substring(0, 80000)}`;
     const title = activeTab.title || "Untitled";
 
     try {
-      const summary = await cerebrasService.summarizePage(content, url, title);
+      const summary = await cerebrasService.summarizePage(content, url, title, signal);
       setMessages([{ role: 'assistant', content: summary }]);
     } catch (error: any) {
+      if (signal.aborted || error?.name === 'AbortError') {
+        return;
+      }
       const errorMsg = error.message || "An error occurred";
       setMessages([{ role: 'assistant', content: `❌ Error: ${errorMsg}` }]);
+    } finally {
+      clearAiRequest(controller);
+      setIsLoading(false);
     }
-
-    setIsLoading(false);
   };
 
   const handleChatSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!chatInput.trim()) return;
+    const rawUserMessage = chatInput.trim();
+    if (!rawUserMessage) return;
 
-    const userMessage = chatInput.trim();
+    const explicitCompose = /^\s*\/(compose|draft|reply)\b/i.test(rawUserMessage);
+    if (explicitCompose || isComposeIntent(rawUserMessage)) {
+      const activeContext = await getActiveFieldContext();
+      const hasActiveField = Boolean(activeContext?.active);
+      if (explicitCompose || hasActiveField) {
+        const cleaned = stripComposePrefix(rawUserMessage) || rawUserMessage;
+        closeSecondaryPanels();
+        setComposePanelOpen(true);
+        setComposeError(hasActiveField ? null : 'Click into a text field to use compose.');
+        setComposePrompt(cleaned);
+        if (hasActiveField) {
+          await handleComposeGenerateWithPrompt(cleaned);
+        }
+        setChatInput("");
+        return;
+      }
+    }
+
+    const lastAssistantMessage = getLastAssistantMessage(messages);
+    const pendingFollowUp = pendingFollowUpRef.current;
+    const isFollowUp = shouldTreatAsFollowUp(rawUserMessage, pendingFollowUp, lastAssistantMessage);
+    if (!isFollowUp) {
+      pendingFollowUpRef.current = null;
+      setCompletedTabInfo(null);
+    }
+
+    const userMessage = rawUserMessage;
+    const plannerMessage = isFollowUp && pendingFollowUp
+      ? buildFollowUpPrompt(rawUserMessage, pendingFollowUp)
+      : rawUserMessage;
+    if (isFollowUp && pendingFollowUp) {
+      pendingFollowUpRef.current = { ...pendingFollowUp, askedAt: Date.now() };
+    }
+
     setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
     setChatInput("");
     setIsLoading(true);
+    const controller = beginAiRequest();
+    const { signal } = controller;
 
     try {
+      const ensureNotAborted = () => {
+        if (signal.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+      };
       let schemaText: string | null = null;
       let domSnapshot: any = null;
       let chatModeAnswered = false;
       let chatModeExecutedPageActions = false;
-      let goalHint = userMessage;
+      let baseGoalText = isFollowUp && pendingFollowUp?.goalText ? pendingFollowUp.goalText : userMessage;
+      let goalHint = baseGoalText;
+      let goalText = isFollowUp ? `${baseGoalText}\nFollow-up: ${userMessage}` : baseGoalText;
+      let youtubeSearchPerformed = false;
+      let strictPlanExecution = false;
+      let goalPlan: GoalPlan | null = null;
       const explicitActionRequest = /\b(click|type|fill|scroll|select|press|submit|enter|choose|tick|check|on this page|this page|open menu)\b/i.test(userMessage);
+      const skipInitialGoalCheck = isFollowUp && explicitActionRequest;
       const immediateTarget = getDirectNavigationTarget(userMessage);
       const initialUrl = getActiveWebview()?.getURL?.() ?? activeTab.url;
       const initialIsHome = !initialUrl || initialUrl.startsWith('data:') || initialUrl.startsWith('about:');
+      let deferredImmediateTarget = immediateTarget && initialIsHome && !explicitActionRequest ? immediateTarget : null;
 
-      if (immediateTarget && initialIsHome && !explicitActionRequest) {
-        const target = navigateTo(immediateTarget, false);
-        if (target) {
-          setMessages(prev => [
-            ...prev,
-            { role: 'assistant', content: `Navigating to ${target}` }
-          ]);
-          await delay(300);
-          await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+      if (chatModeEnabled && cerebrasService.isConfigured()) {
+        const skillMatch = skillMemoryService.findSkill(userMessage);
+        if (skillMatch) {
+          skillReplayRef.current = true;
+          try {
+            setMessages(prev => [
+              ...prev,
+              { role: 'assistant', content: 'I remember how to do this. Replaying the steps from last time.' }
+            ]);
+            await replaySkill(skillMatch, signal);
+            skillMemoryService.recordUse(skillMatch.id);
+            refreshSkillData();
+            markChatTaskComplete();
+            storePendingFollowUp({
+              goalText: baseGoalText,
+              userMessage,
+              assistantMessage: '✅ Task done.',
+              goalPlan,
+              completed: true
+            });
+            setMessages(prev => [
+              ...prev,
+              { role: 'assistant', content: '✅ Task done.' }
+            ]);
+          } finally {
+            skillReplayRef.current = false;
+          }
+          setIsLoading(false);
+          return;
         }
+        beginSkillCapture(userMessage);
       }
 
       if (chatModeEnabled && cerebrasService.isConfigured()) {
         try {
-          const memorySummary = visitMemoryService.getMemorySummary(8);
           const contextSummary = buildContextSummary();
-          const goalPlanRaw = await cerebrasService.planGoalTask(userMessage);
-          const goalPlan = parseGoalPlan(goalPlanRaw);
-          const goalText = goalPlan?.goal?.trim() || userMessage;
-          goalHint = goalText;
+          let reusedPlan = false;
+          if (isFollowUp && pendingFollowUp && (pendingFollowUp.planSteps?.length || pendingFollowUp.successCriteria?.length)) {
+            goalPlan = {
+              goal: baseGoalText,
+              steps: pendingFollowUp.planSteps ?? [],
+              successCriteria: pendingFollowUp.successCriteria,
+              questions: undefined
+            };
+            strictPlanExecution = Boolean(goalPlan.steps.length);
+            reusedPlan = true;
+          }
+
+          if (!reusedPlan) {
+            const goalPlanRaw = await cerebrasService.planGoalTask(plannerMessage, signal);
+            goalPlan = parseGoalPlan(goalPlanRaw);
+            if (goalPlan?.goal?.trim()) {
+              baseGoalText = goalPlan.goal.trim();
+            }
+            strictPlanExecution = Boolean(goalPlan?.steps?.length);
+          }
+
+          goalHint = baseGoalText;
+          goalText = isFollowUp ? `${baseGoalText}\nFollow-up: ${userMessage}` : baseGoalText;
+          updateSkillGoal(baseGoalText);
+          const memorySummary = strictPlanExecution ? '' : visitMemoryService.getMemorySummary(8);
+          const frequentSitesForPlan = strictPlanExecution ? [] : frequentSites;
 
           if (goalPlan && (goalPlan.goal || goalPlan.steps.length || goalPlan.successCriteria?.length)) {
             const planLines = goalPlan.steps.slice(0, 6).map((step, idx) => `${idx + 1}. ${step}`).join('\n');
@@ -1946,8 +2875,32 @@ ${questionLines}` : ''
               setMessages(prev => [...prev, { role: 'assistant', content: goalLines }]);
             }
             if (goalPlan.questions && goalPlan.questions.length > 0) {
+              storePendingFollowUp({
+                goalText: baseGoalText,
+                userMessage,
+                assistantMessage: goalLines || goalText,
+                goalPlan,
+                completed: false,
+                force: true
+              });
+              finalizeSkillCapture(false);
               setIsLoading(false);
               return;
+            }
+          }
+
+          if (deferredImmediateTarget) {
+            const target = navigateTo(deferredImmediateTarget, false);
+            if (target) {
+              setMessages(prev => [
+                ...prev,
+                { role: 'assistant', content: `Navigating to ${target}` }
+              ]);
+              recordSkillNavigation(target, false);
+              deferredImmediateTarget = null;
+              await delay(300);
+              await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+              ensureNotAborted();
             }
           }
 
@@ -1955,25 +2908,47 @@ ${questionLines}` : ''
           const maxAgentSteps = 6;
 
           for (let step = 1; step <= maxAgentSteps; step += 1) {
+            ensureNotAborted();
             const page = await getPageContent();
-            const goalCheckRaw = await cerebrasService.checkGoalCompletion(
-              goalText,
-              userMessage,
-              {
-                url: page.url,
-                title: page.title || activeTab.title || "Untitled",
-                content: page.content
-              },
-              goalPlan?.steps,
-              lastActionSummary
-            );
-            const goalCheck = parseGoalCheck(goalCheckRaw);
+            let goalCheck: GoalCheck | null = null;
+            if (!(skipInitialGoalCheck && step === 1)) {
+              const goalCheckRaw = await cerebrasService.checkGoalCompletion(
+                goalText,
+                plannerMessage,
+                {
+                  url: page.url,
+                  title: page.title || activeTab.title || "Untitled",
+                  content: page.content
+                },
+                goalPlan?.steps,
+                lastActionSummary,
+                signal
+              );
+              goalCheck = parseGoalCheck(goalCheckRaw);
+            }
 
             if (goalCheck?.completed) {
               const completionMessage = goalCheck.response
                 || goalCheck.evidence
                 || 'Goal completed based on the current page.';
-              setMessages(prev => [...prev, { role: 'assistant', content: completionMessage }]);
+              const alreadyDone = /(done|complete|completed|finished|success|resolved|achieved)/i.test(completionMessage);
+              const finalMessage = alreadyDone
+                ? completionMessage
+                : `${completionMessage} ✅ Task done.`;
+              markChatTaskComplete();
+              storePendingFollowUp({
+                goalText: baseGoalText,
+                userMessage,
+                assistantMessage: finalMessage,
+                goalPlan,
+                lastActionSummary,
+                completed: true
+              });
+              setMessages(prev => [
+                ...prev,
+                { role: 'assistant', content: finalMessage }
+              ]);
+              finalizeSkillCapture(true);
               chatModeAnswered = true;
               break;
             }
@@ -1982,7 +2957,17 @@ ${questionLines}` : ''
               const followUp = goalCheck.response
                 || goalCheck.question
                 || 'I need more details to continue. What specifics should I use?';
+              storePendingFollowUp({
+                goalText: baseGoalText,
+                userMessage,
+                assistantMessage: followUp,
+                goalPlan,
+                lastActionSummary,
+                completed: false,
+                force: true
+              });
               setMessages(prev => [...prev, { role: 'assistant', content: followUp }]);
+              finalizeSkillCapture(false);
               chatModeAnswered = true;
               break;
             }
@@ -1991,11 +2976,11 @@ ${questionLines}` : ''
             schemaText = schemaBundle?.schemaText || null;
             domSnapshot = schemaBundle?.snapshot || null;
 
-            const planRaw = await cerebrasService.planChatBrowsing(userMessage, {
+            const planRaw = await cerebrasService.planChatBrowsing(plannerMessage, {
               currentUrl: page.url,
               currentTitle: page.title || activeTab.title || "Untitled",
               memorySummary,
-              frequentSites,
+              frequentSites: frequentSitesForPlan,
               pageSchema: schemaText,
               contextNotesSummary: contextSummary,
               goal: goalText,
@@ -2003,7 +2988,7 @@ ${questionLines}` : ''
               successCriteria: goalPlan?.successCriteria,
               stepIndex: step,
               lastActionSummary
-            });
+            }, signal);
             const browsingPlan = parseChatBrowsingPlan(planRaw);
 
             if (!browsingPlan) {
@@ -2011,11 +2996,25 @@ ${questionLines}` : ''
             }
 
             if (browsingPlan.response) {
-              setMessages(prev => [...prev, { role: 'assistant', content: browsingPlan.response! }]);
+              const responseLower = browsingPlan.response.toLowerCase();
+              const mentionsHistory = /history|frequent|visited/.test(responseLower);
+              const claimsDirectNav = /navigate directly|direct link|i(?:'|’)ll navigate directly|i will navigate directly/.test(responseLower);
+              const suppressResponse = strictPlanExecution && (mentionsHistory || claimsDirectNav);
+              if (!suppressResponse) {
+                setMessages(prev => [...prev, { role: 'assistant', content: browsingPlan.response! }]);
+              }
             }
 
             if (!browsingPlan.actions.length) {
               if (browsingPlan.response) {
+                storePendingFollowUp({
+                  goalText: baseGoalText,
+                  userMessage,
+                  assistantMessage: browsingPlan.response,
+                  goalPlan,
+                  lastActionSummary,
+                  completed: false
+                });
                 chatModeAnswered = true;
               }
               break;
@@ -2023,9 +3022,16 @@ ${questionLines}` : ''
 
             let navigationOccurred = false;
             let actionAttempted = false;
-            const pageDomainRelevant = isDomainRelevantToGoal(`${goalText} ${userMessage}`, page.url);
+            let pageDomainRelevant = isDomainRelevantToGoal(`${goalText} ${userMessage}`, page.url);
             const directTarget = getDirectNavigationTarget(`${goalText} ${userMessage}`);
             const isHomeLike = !page.url || page.url.startsWith('data:') || page.url.startsWith('about:');
+            const isYouTubeResults = isYouTubeResultsUrl(page.url);
+            if (isYouTubeResults) {
+              pageDomainRelevant = true;
+            }
+            const preferPageActions = Boolean(schemaText) && (explicitActionRequest || pageDomainRelevant || isYouTubeResults);
+            let handledPlanActions = false;
+            let deferredNavAction: ChatBrowsingAction | null = null;
 
             if (directTarget && !page.url.includes(directTarget.replace(/^https?:\/\//, ''))) {
               const target = navigateTo(directTarget, false);
@@ -2036,8 +3042,10 @@ ${questionLines}` : ''
                   ...prev,
                   { role: 'assistant', content: `Navigating to ${target}` }
                 ]);
+                recordSkillNavigation(target, false);
                 await delay(300);
                 await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+                ensureNotAborted();
                 lastActionSummary = `Navigated to ${target}.`;
                 continue;
               }
@@ -2051,35 +3059,68 @@ ${questionLines}` : ''
               }
             })();
 
-            if (currentHost.includes('youtube.com') && !explicitActionRequest) {
+            if (!youtubeSearchPerformed && currentHost.includes('youtube.com') && !explicitActionRequest && !isYouTubeResults && (isHomeLike || isYouTubeHomeUrl(page.url))) {
               const query = extractSearchQueryFromGoal(goalText || userMessage);
-              const wv = getActiveWebview();
-              if (wv && query) {
+              if (query) {
+                const selector = 'input#search, input[name="search_query"]';
+                const ytPlan: ActionPlan = {
+                  actions: [
+                    { type: 'focus', selector },
+                    { type: 'type', selector, text: query },
+                    { type: 'press', selector, key: 'Enter' }
+                  ],
+                  notes: 'Search YouTube using the top search box.'
+                };
                 try {
-                  const ran = await wv.executeJavaScript(`
-                    (() => {
-                      const query = ${JSON.stringify(query)};
-                      const input = document.querySelector('input#search') || document.querySelector('input[name="search_query"]');
-                      if (!input) return false;
-                      input.focus();
-                      input.value = query;
-                      input.dispatchEvent(new Event('input', { bubbles: true }));
-                      input.dispatchEvent(new Event('change', { bubbles: true }));
-                      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-                      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
-                      return true;
-                    })()
-                  `);
-                  if (ran) {
+                  const wv = getActiveWebview();
+                  const beforeUrl = wv?.getURL?.() ?? page.url;
+                  const { executed, attempted, results } = await executeActionPlan(ytPlan);
+                  if (attempted > 0) {
                     actionAttempted = true;
                     chatModeExecutedPageActions = true;
+                    youtubeSearchPerformed = true;
+                    const logId = crypto.randomUUID();
                     setMessages(prev => [
                       ...prev,
-                      { role: 'assistant', content: `Searching YouTube for "${query}".` }
+                      {
+                        id: logId,
+                        role: 'assistant',
+                        content: `Searching YouTube for "${query}".`,
+                        kind: 'action-log',
+                        actions: results,
+                        summary: `Searching YouTube for "${query}".`
+                      }
                     ]);
+                  }
+                  const pressOk = Array.isArray(results)
+                    ? results.some(entry => entry.action.type === 'press' && entry.status === 'ok')
+                    : false;
+                  if (pressOk) {
+                    const [didNavigate, afterUrl] = await Promise.all([
+                      waitForWebviewEvent(wv, ['did-navigate', 'did-navigate-in-page', 'did-stop-loading', 'dom-ready'], 9000),
+                      waitForUrlChange(wv, beforeUrl, 9000)
+                    ]);
+                    ensureNotAborted();
+                    const urlChanged = beforeUrl && afterUrl && afterUrl !== beforeUrl;
+                    if (didNavigate || urlChanged) {
+                      lastActionSummary = `Searched YouTube for ${query}.`;
+                      continue;
+                    }
+                  }
+
+                  const fallbackUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+                  const target = navigateTo(fallbackUrl, false);
+                  if (target) {
+                    setMessages(prev => [
+                      ...prev,
+                      { role: 'assistant', content: `Opening YouTube results for "${query}".` }
+                    ]);
+                    recordSkillNavigation(target, false);
+                    youtubeSearchPerformed = true;
                     await delay(300);
                     await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
-                    lastActionSummary = `Searched YouTube for ${query}.`;
+                    ensureNotAborted();
+                    lastActionSummary = `Opened YouTube results for ${query}.`;
                     continue;
                   }
                 } catch {
@@ -2096,54 +3137,18 @@ ${questionLines}` : ''
                   ...prev,
                   { role: 'assistant', content: `Navigating to ${target}` }
                 ]);
+                recordSkillNavigation(target, false);
                 await delay(300);
                 await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+                ensureNotAborted();
                 lastActionSummary = `Navigated to ${target}.`;
                 continue;
               }
             }
 
-            for (const action of browsingPlan.actions) {
-              if (action.type === 'open_url') {
-                const target = navigateTo(action.url, action.inNewTab);
-                if (target) {
-                  navigationOccurred = true;
-                  actionAttempted = true;
-                  setMessages(prev => [
-                    ...prev,
-                    { role: 'assistant', content: `Navigating to ${target}` }
-                  ]);
-                }
-                break;
-              }
-              if (action.type === 'search') {
-                const target = navigateTo(action.query, false);
-                if (target) {
-                  navigationOccurred = true;
-                  actionAttempted = true;
-                  setMessages(prev => [
-                    ...prev,
-                    { role: 'assistant', content: `Searching for: ${action.query}` }
-                  ]);
-                }
-                break;
-              }
-              if (action.type === 'suggest_sites') {
-                const lines = action.suggestions.slice(0, 8).map((s) => `- ${s}`).join('\n');
-                if (lines) {
-                  setMessages(prev => [
-                    ...prev,
-                    {
-                      role: 'assistant',
-                      content: `Here are some sites you might want:
-${lines}`
-                    }
-                  ]);
-                  actionAttempted = true;
-                }
-                continue;
-              }
-              if (action.type === 'page_actions' && action.plan) {
+            if (preferPageActions) {
+              for (const action of browsingPlan.actions) {
+                if (action.type !== 'page_actions' || !action.plan) continue;
                 if (isHomeLike || (!explicitActionRequest && !pageDomainRelevant)) {
                   continue;
                 }
@@ -2151,6 +3156,7 @@ ${lines}`
                 if (attempted > 0) {
                   actionAttempted = true;
                   chatModeExecutedPageActions = true;
+                  handledPlanActions = true;
                   const logId = crypto.randomUUID();
                   setMessages(prev => [
                     ...prev,
@@ -2163,30 +3169,255 @@ ${lines}`
                       summary: `Executed ${executed}/${attempted} page action(s).`
                     }
                   ]);
-                }
-                continue;
-              }
-              if (action.type === 'create_site') {
-                const prompt = action.prompt.trim();
-                if (prompt) {
-                  const type = action.creationType || creationType;
-                  setCreationType(type);
-                  setCreationPrompt(prompt);
-                  setCreationStatus('idle');
-                  setCreationError(null);
-                  closeSecondaryPanels();
-                  setCreatorPanelOpen(true);
-                  if (browserMode === 'chat') {
-                    setBrowserMode('classic');
+                  if (actionPlanMayNavigate(action.plan)) {
+                    const wv = getActiveWebview();
+                    const beforeUrl = wv?.getURL?.() ?? page.url;
+                    const [didNavigate, afterUrl] = await Promise.all([
+                      waitForWebviewEvent(wv, ['did-navigate', 'did-navigate-in-page', 'did-stop-loading', 'dom-ready'], 9000),
+                      waitForUrlChange(wv, beforeUrl, 9000)
+                    ]);
+                    ensureNotAborted();
+                    const urlChanged = beforeUrl && afterUrl && afterUrl !== beforeUrl;
+                    if (didNavigate || urlChanged) {
+                      navigationOccurred = true;
+                    }
                   }
+                }
+                if (navigationOccurred) break;
+              }
+            }
+
+            if (!navigationOccurred) {
+              for (const action of browsingPlan.actions) {
+                if (action.type === 'open_url') {
+                  if (preferPageActions) {
+                    if (!deferredNavAction) deferredNavAction = action;
+                    continue;
+                  }
+                  const target = navigateTo(action.url, action.inNewTab);
+                  if (target) {
+                    navigationOccurred = true;
+                    actionAttempted = true;
+                    setMessages(prev => [
+                      ...prev,
+                      { role: 'assistant', content: `Navigating to ${target}` }
+                    ]);
+                    recordSkillNavigation(target, action.inNewTab ?? false);
+                  }
+                  break;
+                }
+                if (action.type === 'search') {
+                  if (preferPageActions) {
+                    if (!deferredNavAction) deferredNavAction = action;
+                    continue;
+                  }
+                  const target = navigateTo(action.query, false);
+                  if (target) {
+                    navigationOccurred = true;
+                    actionAttempted = true;
+                    setMessages(prev => [
+                      ...prev,
+                      { role: 'assistant', content: `Searching for: ${action.query}` }
+                    ]);
+                    recordSkillNavigation(target, false);
+                  }
+                  break;
+                }
+                if (action.type === 'suggest_sites') {
+                  const lines = action.suggestions.slice(0, 8).map((s) => `- ${s}`).join('\n');
+                  if (lines) {
+                    setMessages(prev => [
+                      ...prev,
+                      {
+                        role: 'assistant',
+                        content: `Here are some sites you might want:
+${lines}`
+                      }
+                    ]);
+                    actionAttempted = true;
+                  }
+                  continue;
+                }
+                if (action.type === 'page_actions' && action.plan) {
+                  if (preferPageActions) {
+                    continue;
+                  }
+                  if (isHomeLike || (!explicitActionRequest && !pageDomainRelevant)) {
+                    continue;
+                  }
+                  const { executed, attempted, results } = await executeActionPlan(action.plan);
+                  if (attempted > 0) {
+                    actionAttempted = true;
+                    chatModeExecutedPageActions = true;
+                    const logId = crypto.randomUUID();
+                    setMessages(prev => [
+                      ...prev,
+                      {
+                        id: logId,
+                        role: 'assistant',
+                        content: `Executed ${executed}/${attempted} page action(s).`,
+                        kind: 'action-log',
+                        actions: results,
+                        summary: `Executed ${executed}/${attempted} page action(s).`
+                      }
+                    ]);
+                    if (actionPlanMayNavigate(action.plan)) {
+                      const wv = getActiveWebview();
+                      const beforeUrl = wv?.getURL?.() ?? page.url;
+                      const [didNavigate, afterUrl] = await Promise.all([
+                        waitForWebviewEvent(wv, ['did-navigate', 'did-navigate-in-page', 'did-stop-loading', 'dom-ready'], 9000),
+                        waitForUrlChange(wv, beforeUrl, 9000)
+                      ]);
+                      ensureNotAborted();
+                      const urlChanged = beforeUrl && afterUrl && afterUrl !== beforeUrl;
+                      if (didNavigate || urlChanged) {
+                        navigationOccurred = true;
+                      }
+                    }
+                  }
+                  if (navigationOccurred) {
+                    break;
+                  }
+                  continue;
+                }
+                if (action.type === 'create_site') {
+                  const prompt = action.prompt.trim();
+                  if (prompt) {
+                    const type = action.creationType || creationType;
+                    setCreationType(type);
+                    setCreationPrompt(prompt);
+                    setCreationStatus('idle');
+                    setCreationError(null);
+                    closeSecondaryPanels();
+                    setCreatorPanelOpen(true);
+                    if (browserMode === 'chat') {
+                      setBrowserMode('classic');
+                    }
+                    storePendingFollowUp({
+                      goalText: baseGoalText,
+                      userMessage,
+                      assistantMessage: 'I opened the Creator with that prompt.',
+                      goalPlan,
+                      lastActionSummary,
+                      completed: false
+                    });
+                    setMessages(prev => [
+                      ...prev,
+                      { role: 'assistant', content: 'I opened the Creator with that prompt.' }
+                    ]);
+                  }
+                  chatModeAnswered = true;
+                  actionAttempted = true;
+                  break;
+                }
+              }
+            }
+
+            if (!navigationOccurred && !actionAttempted && preferPageActions && !handledPlanActions && schemaText) {
+              try {
+                const nextStepHint = goalPlan?.steps?.[Math.max(0, step - 1)] || goalText;
+                const goalScopedRequest = `Goal: ${goalText}\nCurrent step: ${nextStepHint}\nUser request: ${plannerMessage}\nOn this page, identify the exact clicks or inputs needed to advance the goal.`;
+                const actionPlanRaw = await cerebrasService.planPageActions(goalScopedRequest, schemaText, signal);
+                const actionPlan = parseActionPlan(actionPlanRaw);
+                if (actionPlan && actionPlan.actions.length > 0) {
+                  const { executed, attempted, results } = await executeActionPlan(actionPlan);
+                  if (attempted > 0) {
+                    actionAttempted = true;
+                    chatModeExecutedPageActions = true;
+                    handledPlanActions = true;
+                    const logId = crypto.randomUUID();
+                    setMessages(prev => [
+                      ...prev,
+                      {
+                        id: logId,
+                        role: 'assistant',
+                        content: `Executed ${executed}/${attempted} page action(s).`,
+                        kind: 'action-log',
+                        actions: results,
+                        summary: `Executed ${executed}/${attempted} page action(s).`
+                      }
+                    ]);
+                    if (actionPlanMayNavigate(actionPlan)) {
+                      const wv = getActiveWebview();
+                      const beforeUrl = wv?.getURL?.() ?? page.url;
+                      const [didNavigate, afterUrl] = await Promise.all([
+                        waitForWebviewEvent(wv, ['did-navigate', 'did-navigate-in-page', 'did-stop-loading', 'dom-ready'], 9000),
+                        waitForUrlChange(wv, beforeUrl, 9000)
+                      ]);
+                      ensureNotAborted();
+                      const urlChanged = beforeUrl && afterUrl && afterUrl !== beforeUrl;
+                      if (didNavigate || urlChanged) {
+                        navigationOccurred = true;
+                      }
+                    }
+                  }
+                } else {
+                  handledPlanActions = true;
+                  if (isYouTubeResults && domSnapshot?.links?.length) {
+                    const query = extractSearchQueryFromGoal(goalText || userMessage);
+                    const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+                    const queryKey = normalize(query);
+                    const isChannelHref = (href: string) =>
+                      /\/@|\/channel\/|\/c\/|\/user\//.test(href || '');
+                    const bestLink = domSnapshot.links.find((link: any) => {
+                      const href = String(link?.href || '');
+                      if (!href || !isChannelHref(href)) return false;
+                      const label = [link?.text, link?.ariaLabel, link?.name].filter(Boolean).join(' ');
+                      return queryKey && normalize(label).includes(queryKey);
+                    });
+                    if (bestLink?.selector) {
+                      const ytFallbackPlan: ActionPlan = {
+                        actions: [{ type: 'click', selector: bestLink.selector }],
+                        notes: 'Click the channel result from YouTube search.'
+                      };
+                      const { executed, attempted, results } = await executeActionPlan(ytFallbackPlan);
+                      if (attempted > 0) {
+                        actionAttempted = true;
+                        chatModeExecutedPageActions = true;
+                        const logId = crypto.randomUUID();
+                        setMessages(prev => [
+                          ...prev,
+                          {
+                            id: logId,
+                            role: 'assistant',
+                            content: `Executed ${executed}/${attempted} page action(s).`,
+                            kind: 'action-log',
+                            actions: results,
+                            summary: `Executed ${executed}/${attempted} page action(s).`
+                          }
+                        ]);
+                        const wv = getActiveWebview();
+                        const beforeUrl = wv?.getURL?.() ?? page.url;
+                        const [didNavigate, afterUrl] = await Promise.all([
+                          waitForWebviewEvent(wv, ['did-navigate', 'did-navigate-in-page', 'did-stop-loading', 'dom-ready'], 9000),
+                          waitForUrlChange(wv, beforeUrl, 9000)
+                        ]);
+                        ensureNotAborted();
+                        const urlChanged = beforeUrl && afterUrl && afterUrl !== beforeUrl;
+                        if (didNavigate || urlChanged) {
+                          navigationOccurred = true;
+                        }
+                      }
+                    }
+                  }
+                }
+              } catch (actionError) {
+                console.error('Deferred page action planning failed:', actionError);
+              }
+            }
+
+            if (!navigationOccurred && preferPageActions && deferredNavAction && !actionAttempted) {
+              if (deferredNavAction.type === 'open_url' && pageContainsUrl(schemaText, domSnapshot, deferredNavAction.url)) {
+                const target = navigateTo(deferredNavAction.url, deferredNavAction.inNewTab);
+                if (target) {
+                  navigationOccurred = true;
+                  actionAttempted = true;
                   setMessages(prev => [
                     ...prev,
-                    { role: 'assistant', content: 'I opened the Creator with that prompt.' }
+                    { role: 'assistant', content: `Navigating to ${target}` }
                   ]);
+                  recordSkillNavigation(target, deferredNavAction.inNewTab ?? false);
                 }
-                chatModeAnswered = true;
-                actionAttempted = true;
-                break;
               }
             }
 
@@ -2200,12 +3431,14 @@ ${lines}`
                   ...prev,
                   { role: 'assistant', content: `Searching for: ${fallbackQuery}` }
                 ]);
+                recordSkillNavigation(target, false);
               }
             }
 
             if (navigationOccurred) {
               await delay(300);
               await waitForWebviewEvent(getActiveWebview(), ['did-stop-loading', 'dom-ready'], 12000);
+              ensureNotAborted();
               const postNavSchema = await ensurePageSchema();
               schemaText = postNavSchema?.schemaText || null;
               domSnapshot = postNavSchema?.snapshot || null;
@@ -2213,7 +3446,7 @@ ${lines}`
                 try {
                   const nextStepHint = goalPlan?.steps?.[Math.max(0, step - 1)] || goalText;
                   const goalScopedRequest = `Goal: ${goalText}\nCurrent step: ${nextStepHint}\nUser request: ${userMessage}\nProceed with the most relevant page action on this page to advance the goal.`;
-                  const actionPlanRaw = await cerebrasService.planPageActions(goalScopedRequest, schemaText);
+                  const actionPlanRaw = await cerebrasService.planPageActions(goalScopedRequest, schemaText, signal);
                   const actionPlan = parseActionPlan(actionPlanRaw);
                   if (actionPlan && actionPlan.actions.length > 0) {
                     const { executed, attempted, results } = await executeActionPlan(actionPlan);
@@ -2232,6 +3465,15 @@ ${lines}`
                           summary: `Executed ${executed}/${attempted} page action(s).`
                         }
                       ]);
+                      if (actionPlanMayNavigate(actionPlan)) {
+                        const wv = getActiveWebview();
+                        const beforeUrl = wv?.getURL?.() ?? '';
+                        await Promise.all([
+                          waitForWebviewEvent(wv, ['did-navigate', 'did-navigate-in-page', 'did-stop-loading', 'dom-ready'], 9000),
+                          waitForUrlChange(wv, beforeUrl, 9000)
+                        ]);
+                        ensureNotAborted();
+                      }
                     }
                   }
                 } catch (actionError) {
@@ -2240,6 +3482,7 @@ ${lines}`
               }
             } else if (actionAttempted) {
               await delay(800);
+              ensureNotAborted();
             }
 
             if (browsingPlan.notes) {
@@ -2256,6 +3499,7 @@ ${lines}`
       }
 
       if (chatModeAnswered) {
+        finalizeSkillCapture(false);
         setIsLoading(false);
         return;
       }
@@ -2275,7 +3519,7 @@ ${lines}`
 
       if (schemaText && !chatModeExecutedPageActions && shouldAttemptPageActions) {
         try {
-          const actionPlanRaw = await cerebrasService.planPageActions(userMessage, schemaText);
+          const actionPlanRaw = await cerebrasService.planPageActions(plannerMessage, schemaText, signal);
           const actionPlan = parseActionPlan(actionPlanRaw);
           if (actionPlan && actionPlan.actions.length > 0) {
             const { executed, attempted, results } = await executeActionPlan(actionPlan);
@@ -2307,20 +3551,32 @@ ${lines}`
       const resolvedTitle = title || activeTab.title || "Untitled";
       const contextSummary = buildContextSummary();
       const response = await cerebrasService.chatWithPageAndSchema(
-        userMessage,
+        plannerMessage,
         content,
         resolvedTitle,
         schemaText || undefined,
         domSnapshot || undefined,
-        contextSummary || undefined
+        contextSummary || undefined,
+        signal
       );
+      storePendingFollowUp({
+        goalText: baseGoalText,
+        userMessage,
+        assistantMessage: response,
+        goalPlan,
+        completed: false
+      });
       setMessages(prev => [...prev, { role: 'assistant', content: response }]);
     } catch (error: any) {
+      if (signal.aborted || error?.name === 'AbortError') {
+        return;
+      }
       const errorMsg = error.message || "An error occurred";
       setMessages(prev => [...prev, { role: 'assistant', content: `❌ Error: ${errorMsg}` }]);
+    } finally {
+      clearAiRequest(controller);
+      setIsLoading(false);
     }
-
-    setIsLoading(false);
   };
 
 
@@ -2393,9 +3649,34 @@ ${lines}`
     setHomePanelOpen(false);
     setSettingsPanelOpen(false);
     setMemoryPanelOpen(false);
+    setComposePanelOpen(false);
   };
 
   const getActiveWebview = () => webviewsRef.current[activeIdRef.current];
+
+  const beginAiRequest = () => {
+    if (aiAbortRef.current) {
+      aiAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+    return controller;
+  };
+
+  const clearAiRequest = (controller: AbortController) => {
+    if (aiAbortRef.current === controller) {
+      aiAbortRef.current = null;
+    }
+  };
+
+  const stopAiRequest = () => {
+    if (!aiAbortRef.current) return;
+    aiAbortRef.current.abort();
+    aiAbortRef.current = null;
+    const wv = getActiveWebview();
+    wv?.stop?.();
+    wv?.stopLoading?.();
+  };
 
   const runFindInPage = (query: string, opts?: { forward?: boolean }) => {
     const wv = getActiveWebview();
@@ -2516,6 +3797,45 @@ ${lines}`
     if (editingContextId === id) {
       resetContextForm();
     }
+  };
+
+  const completeOnboarding = (skip = false) => {
+    const profile = {
+      name: onboardingName.trim(),
+      role: onboardingRole.trim(),
+      goals: onboardingGoals.trim(),
+      preferences: onboardingPreferences.trim(),
+      location: onboardingLocation.trim()
+    };
+    const lines: string[] = [];
+    if (!skip) {
+      if (profile.name) lines.push(`Name: ${profile.name}`);
+      if (profile.role) lines.push(`Role: ${profile.role}`);
+      if (profile.goals) lines.push(`Goals: ${profile.goals}`);
+      if (profile.preferences) lines.push(`Preferences: ${profile.preferences}`);
+      if (profile.location) lines.push(`Location: ${profile.location}`);
+    }
+    if (lines.length) {
+      const now = Date.now();
+      const note: ContextNote = {
+        id: crypto.randomUUID(),
+        title: 'User Profile',
+        content: lines.join('\n'),
+        createdAt: now,
+        updatedAt: now
+      };
+      setContextNotes(prev => [note, ...prev].slice(0, 200));
+      localStorage.setItem('onboardingProfile', JSON.stringify(profile));
+    } else if (skip) {
+      localStorage.removeItem('onboardingProfile');
+    }
+    localStorage.setItem('onboardingCompleted', 'true');
+    setOnboardingOpen(false);
+    setOnboardingName('');
+    setOnboardingRole('');
+    setOnboardingGoals('');
+    setOnboardingPreferences('');
+    setOnboardingLocation('');
   };
 
   const contextNotesForDisplay = useMemo(() => {
@@ -2752,7 +4072,11 @@ ${lines}`
   };
 
   const renderWebviews = () => (
-    <div ref={webviewContainerRef} style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+    <div
+      ref={webviewContainerRef}
+      className="webview-shell"
+      style={{ flex: 1, position: "relative", overflow: "hidden", width: "100%", height: "100%" }}
+    >
       {tabs.map(t => {
         const isActive = t.id === activeId;
         return (
@@ -2761,8 +4085,10 @@ ${lines}`
             ref={(el) => {
               if (el) {
                 webviewsRef.current[t.id] = el;
-                el.addEventListener('dom-ready', async () => {
-                  (el as any).executeJavaScript(`
+                if (!(el as any).__abListenersAdded) {
+                  (el as any).__abListenersAdded = true;
+                  el.addEventListener('dom-ready', async () => {
+                    (el as any).executeJavaScript(`
                     (() => {
                       const meta = document.createElement('meta');
                       meta.name = 'viewport';
@@ -2774,48 +4100,49 @@ ${lines}`
                       document.body.style.overflowX = 'auto';
                     })();
                   `);
-                  const currentUrl = (el as any).getURL?.() ?? t.url;
-                  await applyExtensionsToWebview(el, currentUrl);
-                });
-                el.addEventListener('did-navigate', (e: any) => {
-                  const newUrl = e?.url ?? t.url;
-                  if (t.id === activeId) setOmnibox(newUrl);
-                  const isHome = newUrl === (homeUrlRef.current || '');
-                  setTabs(prev => prev.map(x => x.id === t.id
-                    ? { ...x, url: newUrl, isHome, title: isHome ? getHomeTitle() : x.title }
-                    : x
-                  ));
-                  if (!isHome && !newUrl.startsWith('data:')) {
-                    const titleHint = tabs.find(x => x.id === t.id)?.title || t.title || newUrl;
-                    addToHistory(titleHint, newUrl);
-                    recordVisitMemory(newUrl, titleHint);
-                  }
-                });
-                el.addEventListener('page-title-updated', (e: any) => {
-                  const title = e?.title ?? "Tab";
-                  setTabs(prev => prev.map(x => {
-                    if (x.id !== t.id) return x;
-                    const isHome = x.url === (homeUrlRef.current || '');
-                    return { ...x, title: isHome ? getHomeTitle() : title, isHome };
-                  }));
-                  const currentUrl =
-                    (el as any).getURL?.() ??
-                    tabs.find(x => x.id === t.id)?.url ??
-                    t.url;
-                  const isHomeUrl = currentUrl === (homeUrlRef.current || '');
-                  if (!isHomeUrl && !currentUrl.startsWith('data:')) {
-                    recordVisitMemory(currentUrl, title);
-                  }
-                });
-                el.addEventListener('did-fail-load', (e: any) => {
-                  console.error(`Failed to load ${e.url}: ${e.errorDescription}`);
-                });
-                el.addEventListener('found-in-page', (event: any) => {
-                  const result = event?.result;
-                  if (!result) return;
-                  setFindResultCount(result.matches || 0);
-                  setFindActiveMatch(result.activeMatchOrdinal || 0);
-                });
+                    const currentUrl = (el as any).getURL?.() ?? t.url;
+                    await applyExtensionsToWebview(el, currentUrl);
+                  });
+                  el.addEventListener('did-navigate', (e: any) => {
+                    const newUrl = e?.url ?? t.url;
+                    if (t.id === activeId) setOmnibox(newUrl);
+                    const isHome = newUrl === (homeUrlRef.current || '');
+                    setTabs(prev => prev.map(x => x.id === t.id
+                      ? { ...x, url: newUrl, isHome, title: isHome ? getHomeTitle() : x.title }
+                      : x
+                    ));
+                    if (!isHome && !newUrl.startsWith('data:')) {
+                      const titleHint = tabs.find(x => x.id === t.id)?.title || t.title || newUrl;
+                      addToHistory(titleHint, newUrl);
+                      recordVisitMemory(newUrl, titleHint);
+                    }
+                  });
+                  el.addEventListener('page-title-updated', (e: any) => {
+                    const title = e?.title ?? "Tab";
+                    setTabs(prev => prev.map(x => {
+                      if (x.id !== t.id) return x;
+                      const isHome = x.url === (homeUrlRef.current || '');
+                      return { ...x, title: isHome ? getHomeTitle() : title, isHome };
+                    }));
+                    const currentUrl =
+                      (el as any).getURL?.() ??
+                      tabs.find(x => x.id === t.id)?.url ??
+                      t.url;
+                    const isHomeUrl = currentUrl === (homeUrlRef.current || '');
+                    if (!isHomeUrl && !currentUrl.startsWith('data:')) {
+                      recordVisitMemory(currentUrl, title);
+                    }
+                  });
+                  el.addEventListener('did-fail-load', (e: any) => {
+                    console.error(`Failed to load ${e.url}: ${e.errorDescription}`);
+                  });
+                  el.addEventListener('found-in-page', (event: any) => {
+                    const result = event?.result;
+                    if (!result) return;
+                    setFindResultCount(result.matches || 0);
+                    setFindActiveMatch(result.activeMatchOrdinal || 0);
+                  });
+                }
               }
             }}
             src={t.url}
@@ -2951,6 +4278,111 @@ ${lines}`
           </div>
         )}
       </div>
+
+      <div className="memory-manager-section">
+        <div className="memory-manager-header">
+          <span>AI Skills</span>
+          <button className="memory-manager-refresh" onClick={refreshSkillData}>
+            Refresh
+          </button>
+        </div>
+        {skills.length === 0 ? (
+          <div className="memory-manager-empty">No skills saved yet.</div>
+        ) : (
+          <div className="memory-note-list">
+            {skills.slice(0, 20).map(skill => {
+              const isExpanded = Boolean(expandedSkills[skill.id]);
+              const title = skill.goal || skill.trigger || 'Untitled Skill';
+              const updatedAt = new Date(skill.updatedAt).toLocaleString();
+              const lastUsed = skill.lastUsedAt ? new Date(skill.lastUsedAt).toLocaleString() : null;
+              return (
+                <div key={skill.id} className="memory-note-card">
+                  <div className="memory-note-title">{title}</div>
+                  <div className="memory-note-content">
+                    Trigger: {skill.trigger}
+                  </div>
+                  <div className="memory-note-meta">
+                    Steps: {skill.steps.length} · Used {skill.useCount}x · Updated {updatedAt}
+                    {lastUsed ? ` · Last used ${lastUsed}` : ''}
+                  </div>
+                  <div className="memory-note-buttons">
+                    <button className="memory-note-edit" onClick={() => toggleSkillDetails(skill.id)}>
+                      {isExpanded ? 'Hide Details' : 'View Details'}
+                    </button>
+                    <button className="memory-note-delete" onClick={() => deleteSkill(skill.id)}>
+                      Delete
+                    </button>
+                  </div>
+                  {isExpanded && (
+                    <div className="memory-skill-detail">
+                      {skill.refinement ? (
+                        <>
+                          <div className="memory-skill-line">
+                            <strong>Generalized trigger:</strong> {skill.refinement.generalizedTrigger || '—'}
+                          </div>
+                          {skill.refinement.generalizedGoal && (
+                            <div className="memory-skill-line">
+                              <strong>Generalized goal:</strong> {skill.refinement.generalizedGoal}
+                            </div>
+                          )}
+                          {skill.refinement.example && (
+                            <div className="memory-skill-line">
+                              <strong>Example:</strong> {skill.refinement.example}
+                            </div>
+                          )}
+                          {skill.refinement.algorithm?.length ? (
+                            <div className="memory-skill-block">
+                              <div className="memory-skill-block-title">Algorithm</div>
+                              <ol className="memory-skill-list">
+                                {skill.refinement.algorithm.map((step, index) => (
+                                  <li key={`${skill.id}-alg-${index}`}>{step}</li>
+                                ))}
+                              </ol>
+                            </div>
+                          ) : null}
+                          {skill.refinement.reusableSubpaths?.length ? (
+                            <div className="memory-skill-block">
+                              <div className="memory-skill-block-title">Reusable subpaths</div>
+                              <ul className="memory-skill-list">
+                                {skill.refinement.reusableSubpaths.map((item, index) => (
+                                  <li key={`${skill.id}-reuse-${index}`}>{item}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          ) : null}
+                          {skill.refinement.notes && (
+                            <div className="memory-skill-line">
+                              <strong>Notes:</strong> {skill.refinement.notes}
+                            </div>
+                          )}
+                          {skill.refinement.tree?.length ? (
+                            <div className="memory-skill-block">
+                              <div className="memory-skill-block-title">Task tree</div>
+                              <pre className="memory-skill-steps">
+                                {JSON.stringify(skill.refinement.tree, null, 2)}
+                              </pre>
+                            </div>
+                          ) : null}
+                        </>
+                      ) : (
+                        <div className="memory-skill-pending">
+                          Refinement pending (auto-runs every 5 skills).
+                        </div>
+                      )}
+                      <div className="memory-skill-block">
+                        <div className="memory-skill-block-title">Raw steps</div>
+                        <pre className="memory-skill-steps">
+                          {JSON.stringify(skill.steps, null, 2)}
+                        </pre>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </div>
   );
 
@@ -2969,6 +4401,7 @@ ${lines}`
     </div>
   );
 
+  const showChatPreview = (isChatBrowser && (isLoading || aiActionDepth > 0 || chatPreviewPinned || messages.length > 0)) || chatPreviewExpanded;
   const renderChatBody = (variant: 'sidebar' | 'browser') => (
     <div className={`chat-body ${variant === 'browser' ? 'chat-body--browser' : ''}`}>
       <div className="chat-mode-card">
@@ -3109,6 +4542,70 @@ ${lines}`
               </div>
             );
           })}
+
+          {isChatBrowser && (
+            <>
+              {chatPreviewExpanded && (
+                <div className="chat-preview-backdrop" />
+              )}
+              <div className={`chat-message chat-message--assistant chat-preview-message ${showChatPreview ? 'chat-preview-message--visible' : 'chat-preview-message--hidden'} ${chatPreviewExpanded ? 'chat-preview-message--expanded' : ''}`}>
+                <div className={`chat-preview-card ${chatPreviewExpanded ? 'chat-preview-card--expanded' : ''}`}>
+                  <div className="chat-preview-header">
+                    <div className="chat-preview-label">Live tab preview (AI actions)</div>
+                    <div className="chat-preview-actions">
+                      {completedTabInfo && (
+                        <button
+                          type="button"
+                          className="chat-preview-toggle"
+                          onClick={addCompletedTabToTop}
+                        >
+                          Add to Tabs
+                        </button>
+                      )}
+                      {chatPreviewExpanded ? (
+                        <button
+                          type="button"
+                          className="chat-preview-toggle"
+                          onClick={() => {
+                            setChatPreviewPinned(false);
+                            setChatPreviewExpanded(false);
+                          }}
+                        >
+                          Close
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="chat-preview-toggle"
+                          onClick={() => {
+                            setChatPreviewPinned(true);
+                            setChatPreviewExpanded(true);
+                          }}
+                        >
+                          Expand
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div
+                    className="chat-preview-content"
+                    aria-hidden="true"
+                    ref={chatPreviewRef}
+                    onClick={() => {
+                      if (!chatPreviewExpanded) {
+                        setChatPreviewPinned(true);
+                        setChatPreviewExpanded(true);
+                      }
+                    }}
+                  >
+                    <div className="chat-preview-stage" style={{ transform: `scale(${chatPreviewScale})` }}>
+                      {renderWebviews()}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
 
           {isLoading && (
             <div className="chat-message chat-message--assistant">
@@ -3269,6 +4766,16 @@ ${lines}`
           title="Summarize this page"
         >
           📝 Summarize
+        </button>
+        <button
+          className="btn btn-ghost"
+          onClick={() => {
+            closeSecondaryPanels();
+            setComposePanelOpen(true);
+          }}
+          title="Compose text with page context"
+        >
+          ✍️ Compose
         </button>
 
         <button
@@ -3458,16 +4965,6 @@ ${lines}`
           🔬 Research
         </button>
         <button
-          className={`btn ${homePanelOpen ? "btn-primary" : "btn-ghost"}`}
-          onClick={() => {
-            const next = !homePanelOpen;
-            closeSecondaryPanels();
-            setHomePanelOpen(next);
-          }}
-        >
-          🏠 Home
-        </button>
-        <button
           className={`btn ${creatorPanelOpen ? "btn-primary" : "btn-ghost"}`}
           onClick={() => {
             const next = !creatorPanelOpen;
@@ -3516,7 +5013,7 @@ ${lines}`
         ) : (
           <>
             {/* Left side panels */}
-            {(bookmarksPanelOpen || historyPanelOpen || downloadsPanelOpen || watchedPagesPanelOpen || researchPanelOpen || jsonPanelOpen || customizationPanelOpen || extensionsPanelOpen || settingsPanelOpen || creatorPanelOpen || homePanelOpen) && (
+            {(bookmarksPanelOpen || historyPanelOpen || downloadsPanelOpen || watchedPagesPanelOpen || researchPanelOpen || jsonPanelOpen || customizationPanelOpen || extensionsPanelOpen || settingsPanelOpen || creatorPanelOpen) && (
               <div className="side-panel" style={{ width: "300px" }}>
             {/* Bookmarks Panel */}
             {bookmarksPanelOpen && (
@@ -3824,265 +5321,6 @@ ${lines}`
                       </div>
                     ))
                   )}
-                </div>
-              </>
-            )}
-
-            {/* Home Panel */}
-            {homePanelOpen && (
-              <>
-                <div className="panel-header">
-                  <span className="panel-title">🏠 Home</span>
-                  <button
-                    onClick={() => setHomePanelOpen(false)}
-                    className="btn btn-ghost btn-icon"
-                    title="Close"
-                  >
-                    ×
-                  </button>
-                </div>
-                <div className="p-2 flex-1 overflow-y-auto">
-                  <div className="text-xs text-muted mb-3">
-                    New tabs open to this home screen. Customize everything below.
-                  </div>
-                  <div className="p-3 rounded bg-surface border mb-3">
-                    <div className="text-xs font-bold mb-2 text-primary">Branding</div>
-                    <input
-                      value={homeConfig.title}
-                      onChange={(e) => updateHomeConfig({ title: e.target.value })}
-                      placeholder="Home title"
-                      className="w-full p-2 rounded bg-surface-2 border text-xs mb-2 outline-none focus:border-accent"
-                    />
-                    <input
-                      value={homeConfig.subtitle}
-                      onChange={(e) => updateHomeConfig({ subtitle: e.target.value })}
-                      placeholder="Subtitle"
-                      className="w-full p-2 rounded bg-surface-2 border text-xs mb-2 outline-none focus:border-accent"
-                    />
-                    <select
-                      value={homeConfig.layout}
-                      onChange={(e) => updateHomeConfig({ layout: e.target.value as HomeConfig['layout'] })}
-                      className="w-full p-2 rounded bg-surface-2 border text-xs outline-none focus:border-accent"
-                    >
-                      <option value="center">Centered Layout</option>
-                      <option value="split">Split Layout</option>
-                    </select>
-                    <button
-                      onClick={() => setHomeConfig(DEFAULT_HOME_CONFIG)}
-                      className="btn btn-ghost text-xs w-full mt-2 border"
-                    >
-                      Reset to Default
-                    </button>
-                  </div>
-
-                  <div className="p-3 rounded bg-surface border mb-3">
-                    <div className="text-xs font-bold mb-2 text-primary">Colors</div>
-                    <div className="flex gap-2 mb-2">
-                      <div className="flex-1">
-                        <div className="text-xs text-muted mb-1">Background A</div>
-                        <input
-                          type="color"
-                          value={homeConfig.backgroundStart}
-                          onChange={(e) => updateHomeConfig({ backgroundStart: e.target.value })}
-                          className="w-full h-9 rounded bg-surface-2 border"
-                        />
-                      </div>
-                      <div className="flex-1">
-                        <div className="text-xs text-muted mb-1">Background B</div>
-                        <input
-                          type="color"
-                          value={homeConfig.backgroundEnd}
-                          onChange={(e) => updateHomeConfig({ backgroundEnd: e.target.value })}
-                          className="w-full h-9 rounded bg-surface-2 border"
-                        />
-                      </div>
-                    </div>
-                    <div className="flex gap-2">
-                      <div className="flex-1">
-                        <div className="text-xs text-muted mb-1">Accent</div>
-                        <input
-                          type="color"
-                          value={homeConfig.accent}
-                          onChange={(e) => updateHomeConfig({ accent: e.target.value })}
-                          className="w-full h-9 rounded bg-surface-2 border"
-                        />
-                      </div>
-                      <div className="flex-1">
-                        <div className="text-xs text-muted mb-1">Text</div>
-                        <input
-                          type="color"
-                          value={homeConfig.text}
-                          onChange={(e) => updateHomeConfig({ text: e.target.value })}
-                          className="w-full h-9 rounded bg-surface-2 border"
-                        />
-                      </div>
-                      <div className="flex-1">
-                        <div className="text-xs text-muted mb-1">Card</div>
-                        <input
-                          value={homeConfig.card}
-                          onChange={(e) => updateHomeConfig({ card: e.target.value })}
-                          placeholder="rgba(15, 23, 42, 0.85)"
-                          className="w-full p-2 rounded bg-surface-2 border text-xs outline-none focus:border-accent"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="p-3 rounded bg-surface border mb-3">
-                    <div className="text-xs font-bold mb-2 text-primary">Search & Widgets</div>
-                    <label className="text-xs text-muted flex items-center gap-2 mb-2">
-                      <input
-                        type="checkbox"
-                        checked={homeConfig.showSearch}
-                        onChange={(e) => updateHomeConfig({ showSearch: e.target.checked })}
-                        className="accent-accent"
-                      />
-                      Show search bar
-                    </label>
-                    <select
-                      value={homeConfig.searchEngine}
-                      onChange={(e) => updateHomeConfig({ searchEngine: e.target.value as HomeSearchEngine })}
-                      className="w-full p-2 rounded bg-surface-2 border text-xs mb-2 outline-none focus:border-accent"
-                    >
-                      <option value="duckduckgo">DuckDuckGo</option>
-                      <option value="google">Google</option>
-                      <option value="bing">Bing</option>
-                    </select>
-                    <label className="text-xs text-muted flex items-center gap-2 mb-2">
-                      <input
-                        type="checkbox"
-                        checked={homeConfig.showDateTime}
-                        onChange={(e) => updateHomeConfig({ showDateTime: e.target.checked })}
-                        className="accent-accent"
-                      />
-                      Show time and date
-                    </label>
-                    <label className="text-xs text-muted flex items-center gap-2">
-                      <input
-                        type="checkbox"
-                        checked={homeConfig.showBookmarks}
-                        onChange={(e) => updateHomeConfig({ showBookmarks: e.target.checked })}
-                        className="accent-accent"
-                      />
-                      Show bookmarks section
-                    </label>
-                  </div>
-
-                  <div className="p-3 rounded bg-surface border mb-3">
-                    <div className="text-xs font-bold mb-2 text-primary">Background Image</div>
-                    <input
-                      value={homeConfig.backgroundImage}
-                      onChange={(e) => updateHomeConfig({ backgroundImage: e.target.value })}
-                      placeholder="Optional image URL"
-                      className="w-full p-2 rounded bg-surface-2 border text-xs outline-none focus:border-accent"
-                    />
-                  </div>
-
-                  <div className="p-3 rounded bg-surface border mb-3">
-                    <div className="text-xs font-bold mb-2 text-primary">Quick Links</div>
-                    {homeConfig.quickLinks.map(link => (
-                      <div key={link.id} className="p-2 rounded bg-surface-2 border mb-2">
-                        <div className="flex gap-2 mb-2">
-                          <input
-                            value={link.icon || ''}
-                            onChange={(e) => updateQuickLink(link.id, { icon: e.target.value })}
-                            placeholder="🔗"
-                            className="w-16 p-2 rounded bg-surface border text-xs outline-none focus:border-accent text-center"
-                          />
-                          <input
-                            value={link.label}
-                            onChange={(e) => updateQuickLink(link.id, { label: e.target.value })}
-                            placeholder="Label"
-                            className="flex-1 p-2 rounded bg-surface border text-xs outline-none focus:border-accent"
-                          />
-                        </div>
-                        <input
-                          value={link.url}
-                          onChange={(e) => updateQuickLink(link.id, { url: e.target.value })}
-                          placeholder="https://..."
-                          className="w-full p-2 rounded bg-surface border text-xs mb-2 outline-none focus:border-accent"
-                        />
-                        <button
-                          onClick={() => removeQuickLink(link.id)}
-                          className="btn btn-danger text-xs w-full"
-                        >
-                          Remove
-                        </button>
-                      </div>
-                    ))}
-                    <div className="p-2 rounded bg-surface-2 border">
-                      <div className="text-xs text-muted mb-2">Add new link</div>
-                      <div className="flex gap-2 mb-2">
-                        <input
-                          value={homeLinkIcon}
-                          onChange={(e) => setHomeLinkIcon(e.target.value)}
-                          placeholder="✨"
-                          className="w-16 p-2 rounded bg-surface border text-xs outline-none focus:border-accent text-center"
-                        />
-                        <input
-                          value={homeLinkLabel}
-                          onChange={(e) => setHomeLinkLabel(e.target.value)}
-                          placeholder="Label"
-                          className="flex-1 p-2 rounded bg-surface border text-xs outline-none focus:border-accent"
-                        />
-                      </div>
-                      <input
-                        value={homeLinkUrl}
-                        onChange={(e) => setHomeLinkUrl(e.target.value)}
-                        placeholder="https://example.com"
-                        className="w-full p-2 rounded bg-surface border text-xs mb-2 outline-none focus:border-accent"
-                      />
-                      <button
-                        onClick={addQuickLink}
-                        className="btn btn-primary text-xs w-full"
-                      >
-                        Add Link
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="p-3 rounded bg-surface border mb-3">
-                    <div className="text-xs font-bold mb-2 text-primary">Custom HTML</div>
-                    <textarea
-                      value={homeConfig.customHtml}
-                      onChange={(e) => updateHomeConfig({ customHtml: e.target.value })}
-                      rows={4}
-                      placeholder="<div class='card'>Custom block</div>"
-                      className="w-full p-2 rounded bg-surface-2 border text-xs mb-1 outline-none focus:border-accent resize-y"
-                    />
-                    <div className="text-xs text-muted">
-                      Injected under the widgets section.
-                    </div>
-                  </div>
-
-                  <div className="p-3 rounded bg-surface border mb-3">
-                    <div className="text-xs font-bold mb-2 text-primary">Custom CSS</div>
-                    <textarea
-                      value={homeConfig.customCss}
-                      onChange={(e) => updateHomeConfig({ customCss: e.target.value })}
-                      rows={4}
-                      placeholder=".tile { border-radius: 24px; }"
-                      className="w-full p-2 rounded bg-surface-2 border text-xs mb-1 outline-none focus:border-accent resize-y"
-                    />
-                  </div>
-
-                  <div className="p-3 rounded bg-surface border">
-                    <div className="text-xs font-bold mb-2 text-primary">Preview</div>
-                    <div className="rounded border bg-surface-2" style={{ overflow: 'hidden' }}>
-                      <iframe
-                        title="Home preview"
-                        srcDoc={homePageHtml}
-                        sandbox="allow-scripts"
-                        style={{ width: '100%', height: '260px', border: 0, background: '#0b0f1a' }}
-                      />
-                    </div>
-                    <button
-                      onClick={openHomeInNewTab}
-                      className="btn btn-ghost w-full mt-2 text-xs border"
-                    >
-                      Open Home in New Tab
-                    </button>
-                  </div>
                 </div>
               </>
             )}
@@ -4602,12 +5840,34 @@ ${lines}`
               </div>
             </div>
             <div className="chat-browser-actions">
+              {completedTabInfo && (
+                <button
+                  className="btn btn-ghost"
+                  onClick={addCompletedTabToTop}
+                  title="Add the completed page to the top of tabs"
+                >
+                  📌 Add to Tabs
+                </button>
+              )}
+              {isLoading && (
+                <button className="btn btn-ghost" onClick={stopAiRequest} title="Stop request">⏹ Stop</button>
+              )}
               <button className="btn btn-ghost btn-icon" onClick={() => nav("back")} title="Back">←</button>
               <button className="btn btn-ghost btn-icon" onClick={() => nav("forward")} title="Forward">→</button>
               <button className="btn btn-ghost btn-icon" onClick={() => nav("reload")} title="Reload">⟳</button>
               <button className="btn btn-ghost" onClick={newTab} title="New Tab">＋ Tab</button>
               <button className="btn btn-ghost" onClick={handleQuickSummarize} title="Summarize this page">
                 📝 Summarize
+              </button>
+              <button
+                className="btn btn-ghost"
+                onClick={() => {
+                  closeSecondaryPanels();
+                  setComposePanelOpen(true);
+                }}
+                title="Compose text on this page"
+              >
+                ✍️ Compose
               </button>
               <button className="btn btn-ghost" onClick={() => setMemoryPanelOpen(true)} title="Memory & Context">
                 🧠 Memory
@@ -4619,15 +5879,163 @@ ${lines}`
             {memoryPanelOpen ? (
               renderMemoryPage(() => setMemoryPanelOpen(false))
             ) : (
-              <>
-                <div className="chat-browser-chat">
-                  {renderChatBody('browser')}
-                </div>
-                <div className="chat-browser-preview">
-                  {renderWebviews()}
-                </div>
-              </>
+              <div className="chat-browser-chat chat-browser-chat--full">
+                {renderChatBody('browser')}
+              </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {composePanelOpen && (
+        <div className="compose-overlay" onClick={() => setComposePanelOpen(false)}>
+          <div className="compose-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="compose-header">
+              <div className="compose-title">✍️ Compose on Page</div>
+              <button
+                className="btn btn-ghost btn-icon"
+                onClick={() => setComposePanelOpen(false)}
+                title="Close"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="compose-meta">
+              <div className="compose-meta-row">
+                Active field: <span>{composeActiveField?.label || 'None detected (click a field first)'}</span>
+              </div>
+              <label className="compose-toggle">
+                <input
+                  type="checkbox"
+                  checked={composeUseFullContext}
+                  onChange={(e) => setComposeUseFullContext(e.target.checked)}
+                />
+                Use full page context (includes visible comments without scrolling)
+              </label>
+            </div>
+
+            <textarea
+              className="compose-input"
+              placeholder="Describe what you want to write (tone, length, audience, etc.)"
+              value={composePrompt}
+              onChange={(e) => setComposePrompt(e.target.value)}
+              rows={4}
+            />
+
+            <div className="compose-actions">
+              <button
+                className={`btn ${composeLoading ? 'btn-ghost' : 'btn-primary'}`}
+                disabled={composeLoading || !composePrompt.trim()}
+                onClick={handleComposeGenerate}
+              >
+                {composeLoading ? 'Generating…' : 'Generate'}
+              </button>
+              <button
+                className="btn btn-ghost"
+                disabled={!composeResult.trim()}
+                onClick={insertComposeResult}
+              >
+                Insert into field
+              </button>
+              <button
+                className="btn btn-ghost"
+                disabled={!composeResult.trim()}
+                onClick={() => navigator.clipboard.writeText(composeResult)}
+              >
+                Copy
+              </button>
+            </div>
+
+            {composeError && (
+              <div className="compose-error">
+                {composeError}
+              </div>
+            )}
+
+            <textarea
+              className="compose-output"
+              placeholder="Generated text will appear here"
+              value={composeResult}
+              onChange={(e) => setComposeResult(e.target.value)}
+              rows={8}
+            />
+          </div>
+        </div>
+      )}
+
+      {onboardingOpen && (
+        <div className="onboarding-overlay" onClick={() => completeOnboarding(true)}>
+          <div className="onboarding-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="onboarding-header">
+              <div>
+                <div className="onboarding-title">Welcome — a new way to browse</div>
+                <div className="onboarding-subtitle">
+                  Tell us a few things so your AI copilot can help better.
+                </div>
+              </div>
+              <button
+                className="btn btn-ghost btn-icon"
+                onClick={() => completeOnboarding(true)}
+                title="Skip onboarding"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="onboarding-grid">
+              <div className="onboarding-field">
+                <label>Name</label>
+                <input
+                  value={onboardingName}
+                  onChange={(e) => setOnboardingName(e.target.value)}
+                  placeholder="What should we call you?"
+                />
+              </div>
+              <div className="onboarding-field">
+                <label>Role / Work</label>
+                <input
+                  value={onboardingRole}
+                  onChange={(e) => setOnboardingRole(e.target.value)}
+                  placeholder="Designer, student, founder..."
+                />
+              </div>
+              <div className="onboarding-field">
+                <label>Goals</label>
+                <textarea
+                  rows={3}
+                  value={onboardingGoals}
+                  onChange={(e) => setOnboardingGoals(e.target.value)}
+                  placeholder="What are you trying to accomplish with this browser?"
+                />
+              </div>
+              <div className="onboarding-field">
+                <label>Preferences</label>
+                <textarea
+                  rows={3}
+                  value={onboardingPreferences}
+                  onChange={(e) => setOnboardingPreferences(e.target.value)}
+                  placeholder="Tone, format, depth, speed..."
+                />
+              </div>
+              <div className="onboarding-field">
+                <label>Location (optional)</label>
+                <input
+                  value={onboardingLocation}
+                  onChange={(e) => setOnboardingLocation(e.target.value)}
+                  placeholder="City, country"
+                />
+              </div>
+            </div>
+
+            <div className="onboarding-actions">
+              <button className="btn btn-ghost" onClick={() => completeOnboarding(true)}>
+                Skip for now
+              </button>
+              <button className="btn btn-primary" onClick={() => completeOnboarding(false)}>
+                Save & continue
+              </button>
+            </div>
           </div>
         </div>
       )}
