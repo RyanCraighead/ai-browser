@@ -705,33 +705,6 @@ const waitForWebviewEvent = (wv: any, events: string[], timeoutMs = 12000) => {
   });
 };
 
-const ensureWebviewReady = async (wv: any, timeoutMs = 12000) => {
-  if (!wv) return false;
-  if ((wv as any).__abReady) return true;
-  const ready = await waitForWebviewEvent(wv, ['dom-ready'], timeoutMs);
-  if (ready) {
-    (wv as any).__abReady = true;
-  }
-  return ready;
-};
-
-const safeExecuteJavaScript = async (wv: any, script: string, timeoutMs = 12000) => {
-  if (!wv) return null;
-  const ready = await ensureWebviewReady(wv, timeoutMs);
-  if (!ready) return null;
-  try {
-    return await wv.executeJavaScript(script);
-  } catch (error) {
-    const message = String(error || '');
-    if (/dom-ready|attached to the DOM/i.test(message)) {
-      const retryReady = await ensureWebviewReady(wv, timeoutMs);
-      if (!retryReady) return null;
-      return await wv.executeJavaScript(script);
-    }
-    throw error;
-  }
-};
-
 export default function App() {
   const [homeConfig, setHomeConfig] = useState<HomeConfig>(DEFAULT_HOME_CONFIG);
   const [homePanelOpen, setHomePanelOpen] = useState(false);
@@ -1237,12 +1210,11 @@ export default function App() {
 
       for (const watched of watchedPages) {
         try {
-          const content = await safeExecuteJavaScript(wv, `
+          const content = await wv.executeJavaScript(`
             (() => {
               return document.body?.innerText?.substring(0, 1000) || "";
             })()
           `);
-          if (typeof content !== 'string') continue;
 
           const currentHash = btoa(content);
           if (currentHash !== watched.lastHash && watched.notificationsEnabled) {
@@ -1429,7 +1401,7 @@ export default function App() {
     if (!wv) return { url: "", content: "", title: "" };
 
     try {
-      const content = await safeExecuteJavaScript(wv, `
+      const content = await wv.executeJavaScript(`
         (() => {
           const bodyText = document.body?.innerText || "";
           const title = document.title || "";
@@ -1444,9 +1416,6 @@ export default function App() {
         })()
       `);
 
-      if (!content) {
-        throw new Error('Webview not ready');
-      }
       const activeTabSnapshot = tabsRef.current.find(t => t.id === activeIdRef.current);
       const pageTitle = content.title || activeTabSnapshot?.title || activeTab.title || "Untitled";
       const pageUrl = wv.getURL?.() ?? activeTabSnapshot?.url ?? activeTab.url;
@@ -1466,7 +1435,7 @@ export default function App() {
     if (!wv) return null;
 
     try {
-      const snapshot = await safeExecuteJavaScript(wv, `
+      const snapshot = await wv.executeJavaScript(`
         (() => {
           const escapeCss = (value) => {
             if (window.CSS && CSS.escape) return CSS.escape(value);
@@ -1882,7 +1851,7 @@ export default function App() {
     const wv = getActiveWebview();
     if (!wv) return null;
     try {
-      return await safeExecuteJavaScript(wv, `
+      return await wv.executeJavaScript(`
         (() => {
           const trimText = (text, max = 240) => {
             if (!text) return '';
@@ -1996,7 +1965,7 @@ export default function App() {
     const wv = getActiveWebview();
     if (!wv) return '';
     try {
-      const payload = await safeExecuteJavaScript(wv, `
+      const payload = await wv.executeJavaScript(`
         (() => {
           const trimText = (text, max = 240) => {
             if (!text) return '';
@@ -2131,7 +2100,7 @@ ${context.active.containerText ? `- nearby text: ${context.active.containerText}
     const wv = getActiveWebview();
     if (!wv || !composeResult.trim()) return;
     try {
-      const inserted = await safeExecuteJavaScript(wv, `
+      const inserted = await wv.executeJavaScript(`
         (() => {
           const el = document.activeElement;
           if (!el || el === document.body || el === document.documentElement) return false;
@@ -2238,7 +2207,7 @@ ${context.active.containerText ? `- nearby text: ${context.active.containerText}
 
     try {
       setAiActionDepth(prev => prev + 1);
-      const results = await safeExecuteJavaScript(wv, `
+      const results = await wv.executeJavaScript(`
         (async () => {
           const plan = ${JSON.stringify(plan)};
           const results = [];
@@ -2382,7 +2351,7 @@ ${context.active.containerText ? `- nearby text: ${context.active.containerText}
     for (const ext of enabledExtensions) {
       if (ext.match && !url.includes(ext.match)) continue;
       try {
-        await safeExecuteJavaScript(wv, ext.code);
+        await wv.executeJavaScript(ext.code);
       } catch (error) {
         console.error(`Extension failed: ${ext.name}`, error);
       }
@@ -2444,7 +2413,7 @@ ${context.active.containerText ? `- nearby text: ${context.active.containerText}
     const ext = extensions.find(e => e.id === extId);
     if (!ext) return;
     try {
-      await safeExecuteJavaScript(wv, ext.code);
+      await wv.executeJavaScript(ext.code);
     } catch (error) {
       console.error(`Failed to run extension: ${ext.name}`, error);
     }
@@ -4029,7 +3998,7 @@ ${lines}`
     if (!wv) return;
 
     if (!highlightsEnabled) {
-      await safeExecuteJavaScript(wv, `
+      await wv.executeJavaScript(`
         (() => {
           const overlay = document.createElement('div');
           overlay.id = 'ai-highlights-overlay';
@@ -4066,7 +4035,7 @@ ${lines}`
         })()
       `);
     } else {
-      await safeExecuteJavaScript(wv, `
+      await wv.executeJavaScript(`
         (() => {
           const overlay = document.getElementById('ai-highlights-overlay');
           if (overlay) overlay.remove();
@@ -4087,12 +4056,11 @@ ${lines}`
       setWatchedPages(prev => prev.filter(w => w.url !== activeTab.url));
     } else {
       try {
-        const content = await safeExecuteJavaScript(wv, `
+        const content = await wv.executeJavaScript(`
           (() => {
             return document.body?.innerText?.substring(0, 1000) || "";
           })()
         `);
-        if (typeof content !== 'string') return;
 
         const newWatched: WatchedPage = {
           id: crypto.randomUUID(),
@@ -4118,7 +4086,7 @@ ${lines}`
     if (!wv) return;
 
     try {
-      const result = await safeExecuteJavaScript(wv, `
+      await wv.executeJavaScript(`
         (() => {
           const inputs = document.querySelectorAll('input, textarea');
           let filled = 0;
@@ -4155,7 +4123,6 @@ ${lines}`
           return 'Auto-filled ' + filled + ' form fields';
         })()
       `);
-      if (result === null) return;
 
       setMessages(prev => [...prev, {
         role: 'assistant',
@@ -4232,24 +4199,19 @@ ${lines}`
                 webviewsRef.current[t.id] = el;
                 if (!(el as any).__abListenersAdded) {
                   (el as any).__abListenersAdded = true;
-                  (el as any).__abReady = false;
-                  el.addEventListener('did-start-loading', () => {
-                    (el as any).__abReady = false;
-                  });
                   el.addEventListener('dom-ready', async () => {
-                    (el as any).__abReady = true;
-                    await safeExecuteJavaScript(el, `
-                      (() => {
-                        const meta = document.createElement('meta');
-                        meta.name = 'viewport';
-                        meta.content = 'width=1200, initial-scale=1.0, maximum-scale=1.0, user-scalable=0';
-                        const head = document.head || document.getElementsByTagName('head')[0];
-                        if (head) head.insertBefore(meta, head.firstChild);
-                        document.body.style.minWidth = '1200px';
-                        document.body.style.maxWidth = '100%';
-                        document.body.style.overflowX = 'auto';
-                      })();
-                    `);
+                    (el as any).executeJavaScript(`
+                    (() => {
+                      const meta = document.createElement('meta');
+                      meta.name = 'viewport';
+                      meta.content = 'width=1200, initial-scale=1.0, maximum-scale=1.0, user-scalable=0';
+                      const head = document.head || document.getElementsByTagName('head')[0];
+                      if (head) head.insertBefore(meta, head.firstChild);
+                      document.body.style.minWidth = '1200px';
+                      document.body.style.maxWidth = '100%';
+                      document.body.style.overflowX = 'auto';
+                    })();
+                  `);
                     const currentUrl = (el as any).getURL?.() ?? t.url;
                     await applyExtensionsToWebview(el, currentUrl);
                   });

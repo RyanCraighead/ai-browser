@@ -6,66 +6,6 @@ import {
   CustomizationMode
 } from './types';
 
-type WebviewWaiter = { cleanup: () => void };
-const webviewWaiters = new WeakMap<any, WebviewWaiter>();
-
-const waitForWebviewEvent = (wv: any, events: string[], timeoutMs = 12000) => {
-  if (!wv) return Promise.resolve(false);
-  const existing = webviewWaiters.get(wv);
-  if (existing) {
-    existing.cleanup();
-    webviewWaiters.delete(wv);
-  }
-  return new Promise<boolean>((resolve) => {
-    let settled = false;
-    const handler = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(true);
-    };
-    const cleanup = () => {
-      events.forEach((eventName) => wv.removeEventListener(eventName, handler));
-      clearTimeout(timer);
-    };
-    webviewWaiters.set(wv, { cleanup });
-    events.forEach((eventName) => wv.addEventListener(eventName, handler, { once: true }));
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(false);
-    }, timeoutMs);
-  });
-};
-
-const ensureWebviewReady = async (wv: any, timeoutMs = 12000) => {
-  if (!wv) return false;
-  if ((wv as any).__abReady) return true;
-  const ready = await waitForWebviewEvent(wv, ['dom-ready'], timeoutMs);
-  if (ready) {
-    (wv as any).__abReady = true;
-  }
-  return ready;
-};
-
-const safeExecuteJavaScript = async (wv: any, script: string, timeoutMs = 12000) => {
-  if (!wv) return null;
-  const ready = await ensureWebviewReady(wv, timeoutMs);
-  if (!ready) return null;
-  try {
-    return await wv.executeJavaScript(script);
-  } catch (error) {
-    const message = String(error || '');
-    if (/dom-ready|attached to the DOM/i.test(message)) {
-      const retryReady = await ensureWebviewReady(wv, timeoutMs);
-      if (!retryReady) return null;
-      return await wv.executeJavaScript(script);
-    }
-    throw error;
-  }
-};
-
 export class PageCustomizationService {
   private static instance: PageCustomizationService;
   private webview: any = null;
@@ -196,15 +136,13 @@ export class PageCustomizationService {
       }
     `;
 
-    safeExecuteJavaScript(this.webview, script).catch((error) => {
-      console.error('Failed to set up inspection mode:', error);
-    });
+    this.webview.executeJavaScript(script);
   }
 
   async analyzePage(url: string): Promise<PageAnalysis> {
     if (!this.webview) throw new Error('Webview not set');
 
-    const analysis = await safeExecuteJavaScript(this.webview, `
+    const analysis = await this.webview.executeJavaScript(`
       (async () => {
         // Helper to get XPath
         window.__aiGetXPath = (element) => {
@@ -255,7 +193,6 @@ export class PageCustomizationService {
         };
       })()
     `);
-    if (!analysis) throw new Error('Webview not ready');
 
     return analysis;
   }
@@ -263,7 +200,7 @@ export class PageCustomizationService {
   async getElementsBySelector(selector: string): Promise<PageElement[]> {
     if (!this.webview) throw new Error('Webview not set');
 
-    const elements = await safeExecuteJavaScript(this.webview, `
+    return await this.webview.executeJavaScript(`
       (() => {
         const elements = document.querySelectorAll('${selector}');
         window.__aiGetXPath = (element) => {
@@ -295,7 +232,6 @@ export class PageCustomizationService {
         }));
       })()
     `);
-    return Array.isArray(elements) ? elements : [];
   }
 
   async applyTransformation(rule: TransformationRule): Promise<void> {
@@ -344,8 +280,7 @@ export class PageCustomizationService {
       })()
     `;
 
-    const applied = await safeExecuteJavaScript(this.webview, script);
-    if (applied === null) return;
+    await this.webview.executeJavaScript(script);
     this.transformations.push(rule);
   }
 
@@ -379,7 +314,7 @@ export class PageCustomizationService {
   async getAllElements(): Promise<PageElement[]> {
     if (!this.webview) throw new Error('Webview not set');
 
-    const elements = await safeExecuteJavaScript(this.webview, `
+    return await this.webview.executeJavaScript(`
       (() => {
         // Get all major structural elements
         const selectors = ['header', 'nav', 'main', 'section', 'article', 'aside', 'footer', 
@@ -423,13 +358,12 @@ export class PageCustomizationService {
         return elements.slice(0, 100); // Limit to 100 elements
       })()
     `);
-    return Array.isArray(elements) ? elements : [];
   }
 
   async getSelectedElements(): Promise<string[]> {
     if (!this.webview) return [];
 
-    const selected = await safeExecuteJavaScript(this.webview, `
+    return await this.webview.executeJavaScript(`
       (() => {
         const selected = document.querySelectorAll('[data-ai-selected="true"]');
         return Array.from(selected).map(el => {
@@ -444,13 +378,12 @@ export class PageCustomizationService {
         });
       })()
     `);
-    return Array.isArray(selected) ? selected : [];
   }
 
   async highlightElements(xpaths: string[], color: string = '#2563eb'): Promise<void> {
     if (!this.webview) throw new Error('Webview not set');
 
-    const result = await safeExecuteJavaScript(this.webview, `
+    await this.webview.executeJavaScript(`
       (async () => {
         function getElementByXPath(xpath) {
           return document.evaluate(
@@ -474,13 +407,12 @@ export class PageCustomizationService {
         return 'Highlighted ' + xpaths.length + ' elements';
       })()
     `);
-    if (result === null) return;
   }
 
   async clearHighlights(): Promise<void> {
     if (!this.webview) throw new Error('Webview not set');
 
-    const result = await safeExecuteJavaScript(this.webview, `
+    await this.webview.executeJavaScript(`
       (() => {
         document.querySelectorAll('[data-ai-selected]').forEach(el => {
           el.style.outline = '';
@@ -491,18 +423,16 @@ export class PageCustomizationService {
         return 'Highlights cleared';
       })()
     `);
-    if (result === null) return;
   }
 
   async resetPage(): Promise<void> {
     if (!this.webview) throw new Error('Webview not set');
 
-    const result = await safeExecuteJavaScript(this.webview, `
+    await this.webview.executeJavaScript(`
       (() => {
         location.reload();
       })()
     `);
-    if (result === null) return;
     this.transformations = [];
   }
 
@@ -518,7 +448,7 @@ export class PageCustomizationService {
   async getRestructuringSuggestions(): Promise<string[]> {
     if (!this.webview) throw new Error('Webview not set');
 
-    const suggestions = await safeExecuteJavaScript(this.webview, `
+    return await this.webview.executeJavaScript(`
       (() => {
         const suggestions = [];
         
@@ -564,7 +494,6 @@ export class PageCustomizationService {
         return suggestions.slice(0, 10);
       })()
     `);
-    return Array.isArray(suggestions) ? suggestions : [];
   }
 
   async smartRestructure(type: 'simplify' | 'clean' | 'focus' | 'readability' | 'mobile'): Promise<void> {
@@ -653,7 +582,6 @@ export class PageCustomizationService {
       })()
     `;
 
-    const result = await safeExecuteJavaScript(this.webview, script);
-    if (result === null) return;
+    await this.webview.executeJavaScript(script);
   }
 }
