@@ -745,6 +745,7 @@ export default function App() {
     type?: string;
     valuePreview?: string;
   } | null>(null);
+  const [chatTakeoverActive, setChatTakeoverActive] = useState(false);
   const pendingFollowUpRef = useRef<PendingFollowUp | null>(null);
   const aiAbortRef = useRef<AbortController | null>(null);
   const [messages, setMessages] = useState<Array<{
@@ -855,6 +856,14 @@ export default function App() {
   const [onboardingGoals, setOnboardingGoals] = useState('');
   const [onboardingPreferences, setOnboardingPreferences] = useState('');
   const [onboardingLocation, setOnboardingLocation] = useState('');
+  const [onboardingAddress, setOnboardingAddress] = useState('');
+
+  const [profileName, setProfileName] = useState('');
+  const [profileRole, setProfileRole] = useState('');
+  const [profileGoals, setProfileGoals] = useState('');
+  const [profilePreferences, setProfilePreferences] = useState('');
+  const [profileLocation, setProfileLocation] = useState('');
+  const [profileAddress, setProfileAddress] = useState('');
 
   const [contextNotes, setContextNotes] = useState<ContextNote[]>([]);
   const [contextTitle, setContextTitle] = useState("");
@@ -889,6 +898,15 @@ export default function App() {
     refreshSkillData();
   };
 
+  const startChatTakeover = () => {
+    if (isLoading || aiActionDepth > 0) {
+      stopAiRequest();
+    }
+    setChatTakeoverActive(true);
+    setChatPreviewPinned(true);
+    setChatPreviewExpanded(true);
+  };
+
   // Cerebras service
   const cerebrasService = CerebrasService.getInstance();
   const visitMemoryService = useMemo(() => VisitMemoryService.getInstance(), []);
@@ -903,6 +921,7 @@ export default function App() {
   const activeIdRef = useRef(activeId);
   const tabsRef = useRef(tabs);
   const skillRefineInFlightRef = useRef<Set<string>>(new Set());
+  const lastUserMessageRef = useRef<string | null>(null);
 
   const activeTab = useMemo(() => tabs.find(t => t.id === activeId)!, [tabs, activeId]);
   const isChatBrowser = browserMode === 'chat';
@@ -959,6 +978,7 @@ export default function App() {
   useEffect(() => {
     if (memoryPanelOpen) {
       setSkills(skillMemoryService.getSkills());
+      loadProfileFromStorage();
     }
   }, [memoryPanelOpen, skillMemoryService]);
 
@@ -2727,10 +2747,11 @@ ${editingHtml.substring(0, 80000)}`;
     }
   };
 
-  const handleChatSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const rawUserMessage = chatInput.trim();
+  const runChatRequest = async (rawInput: string) => {
+    const rawUserMessage = rawInput.trim();
     if (!rawUserMessage) return;
+    lastUserMessageRef.current = rawUserMessage;
+    setChatTakeoverActive(false);
 
     const explicitCompose = /^\s*\/(compose|draft|reply)\b/i.test(rawUserMessage);
     if (explicitCompose || isComposeIntent(rawUserMessage)) {
@@ -3579,6 +3600,11 @@ ${lines}`
     }
   };
 
+  const handleChatSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await runChatRequest(chatInput);
+  };
+
 
 
   // Bookmark functions
@@ -3799,13 +3825,97 @@ ${lines}`
     }
   };
 
+  const loadProfileFromStorage = () => {
+    const raw = localStorage.getItem('onboardingProfile');
+    if (!raw) {
+      setProfileName('');
+      setProfileRole('');
+      setProfileGoals('');
+      setProfilePreferences('');
+      setProfileLocation('');
+      setProfileAddress('');
+      return;
+    }
+    try {
+      const profile = JSON.parse(raw) as {
+        name?: string;
+        role?: string;
+        goals?: string;
+        preferences?: string;
+        location?: string;
+        address?: string;
+      };
+      setProfileName(profile.name || '');
+      setProfileRole(profile.role || '');
+      setProfileGoals(profile.goals || '');
+      setProfilePreferences(profile.preferences || '');
+      setProfileLocation(profile.location || '');
+      setProfileAddress(profile.address || '');
+    } catch (error) {
+      console.error('Failed to parse onboarding profile:', error);
+    }
+  };
+
+  const upsertUserProfileNote = (profile: {
+    name: string;
+    role: string;
+    goals: string;
+    preferences: string;
+    location: string;
+    address: string;
+  }) => {
+    const lines: string[] = [];
+    if (profile.name) lines.push(`Name: ${profile.name}`);
+    if (profile.role) lines.push(`Role: ${profile.role}`);
+    if (profile.goals) lines.push(`Goals: ${profile.goals}`);
+    if (profile.preferences) lines.push(`Preferences: ${profile.preferences}`);
+    if (profile.location) lines.push(`Location: ${profile.location}`);
+    if (profile.address) lines.push(`Address: ${profile.address}`);
+    const content = lines.join('\n');
+    if (!content) return;
+    const now = Date.now();
+
+    setContextNotes(prev => {
+      const existing = prev.find(note => note.title === 'User Profile');
+      if (existing) {
+        return prev.map(note =>
+          note.id === existing.id
+            ? { ...note, content, updatedAt: now }
+            : note
+        );
+      }
+      const note: ContextNote = {
+        id: crypto.randomUUID(),
+        title: 'User Profile',
+        content,
+        createdAt: now,
+        updatedAt: now
+      };
+      return [note, ...prev].slice(0, 200);
+    });
+  };
+
+  const saveProfileFromEditor = () => {
+    const profile = {
+      name: profileName.trim(),
+      role: profileRole.trim(),
+      goals: profileGoals.trim(),
+      preferences: profilePreferences.trim(),
+      location: profileLocation.trim(),
+      address: profileAddress.trim()
+    };
+    localStorage.setItem('onboardingProfile', JSON.stringify(profile));
+    upsertUserProfileNote(profile);
+  };
+
   const completeOnboarding = (skip = false) => {
     const profile = {
       name: onboardingName.trim(),
       role: onboardingRole.trim(),
       goals: onboardingGoals.trim(),
       preferences: onboardingPreferences.trim(),
-      location: onboardingLocation.trim()
+      location: onboardingLocation.trim(),
+      address: onboardingAddress.trim()
     };
     const lines: string[] = [];
     if (!skip) {
@@ -3814,6 +3924,7 @@ ${lines}`
       if (profile.goals) lines.push(`Goals: ${profile.goals}`);
       if (profile.preferences) lines.push(`Preferences: ${profile.preferences}`);
       if (profile.location) lines.push(`Location: ${profile.location}`);
+      if (profile.address) lines.push(`Address: ${profile.address}`);
     }
     if (lines.length) {
       const now = Date.now();
@@ -3836,6 +3947,7 @@ ${lines}`
     setOnboardingGoals('');
     setOnboardingPreferences('');
     setOnboardingLocation('');
+    setOnboardingAddress('');
   };
 
   const contextNotesForDisplay = useMemo(() => {
@@ -4383,6 +4495,59 @@ ${lines}`
           </div>
         )}
       </div>
+
+      <div className="memory-manager-section">
+        <div className="memory-manager-header">
+          <span>User Profile</span>
+        </div>
+        <div className="memory-note-form">
+          <input
+            type="text"
+            value={profileName}
+            onChange={(e) => setProfileName(e.target.value)}
+            placeholder="Name"
+            className="memory-note-input"
+          />
+          <input
+            type="text"
+            value={profileRole}
+            onChange={(e) => setProfileRole(e.target.value)}
+            placeholder="Role / Work"
+            className="memory-note-input"
+          />
+          <textarea
+            value={profileGoals}
+            onChange={(e) => setProfileGoals(e.target.value)}
+            placeholder="Goals"
+            className="memory-note-textarea"
+          />
+          <textarea
+            value={profilePreferences}
+            onChange={(e) => setProfilePreferences(e.target.value)}
+            placeholder="Preferences"
+            className="memory-note-textarea"
+          />
+          <input
+            type="text"
+            value={profileLocation}
+            onChange={(e) => setProfileLocation(e.target.value)}
+            placeholder="Location"
+            className="memory-note-input"
+          />
+          <input
+            type="text"
+            value={profileAddress}
+            onChange={(e) => setProfileAddress(e.target.value)}
+            placeholder="Address"
+            className="memory-note-input"
+          />
+          <div className="memory-note-actions">
+            <button className="memory-note-save" onClick={saveProfileFromEditor}>
+              Save Profile
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 
@@ -4548,7 +4713,7 @@ ${lines}`
               {chatPreviewExpanded && (
                 <div className="chat-preview-backdrop" />
               )}
-              <div className={`chat-message chat-message--assistant chat-preview-message ${showChatPreview ? 'chat-preview-message--visible' : 'chat-preview-message--hidden'} ${chatPreviewExpanded ? 'chat-preview-message--expanded' : ''}`}>
+              <div className={`chat-message chat-message--assistant chat-preview-message ${showChatPreview ? 'chat-preview-message--visible' : 'chat-preview-message--hidden'} ${chatPreviewExpanded ? 'chat-preview-message--expanded' : ''} ${chatTakeoverActive ? 'chat-preview-message--interactive' : ''}`}>
                 <div className={`chat-preview-card ${chatPreviewExpanded ? 'chat-preview-card--expanded' : ''}`}>
                   <div className="chat-preview-header">
                     <div className="chat-preview-label">Live tab preview (AI actions)</div>
@@ -4589,7 +4754,7 @@ ${lines}`
                   </div>
                   <div
                     className="chat-preview-content"
-                    aria-hidden="true"
+                    aria-hidden={!chatTakeoverActive}
                     ref={chatPreviewRef}
                     onClick={() => {
                       if (!chatPreviewExpanded) {
@@ -5840,6 +6005,31 @@ ${lines}`
               </div>
             </div>
             <div className="chat-browser-actions">
+              {chatTakeoverActive ? (
+                <button
+                  className="btn btn-primary"
+                  onClick={() => {
+                    setChatTakeoverActive(false);
+                    const lastMessage = lastUserMessageRef.current;
+                    if (lastMessage) {
+                      runChatRequest(lastMessage);
+                    }
+                  }}
+                  title="Let the AI continue"
+                >
+                  ▶ Resume AI
+                </button>
+              ) : (
+                (isLoading || aiActionDepth > 0) && (
+                  <button
+                    className="btn btn-ghost"
+                    onClick={startChatTakeover}
+                    title="Pause AI and take over the page"
+                  >
+                    ✋ Take over
+                  </button>
+                )
+              )}
               {completedTabInfo && (
                 <button
                   className="btn btn-ghost"
@@ -6024,6 +6214,14 @@ ${lines}`
                   value={onboardingLocation}
                   onChange={(e) => setOnboardingLocation(e.target.value)}
                   placeholder="City, country"
+                />
+              </div>
+              <div className="onboarding-field">
+                <label>Address (optional)</label>
+                <input
+                  value={onboardingAddress}
+                  onChange={(e) => setOnboardingAddress(e.target.value)}
+                  placeholder="Street, city, postal code"
                 />
               </div>
             </div>

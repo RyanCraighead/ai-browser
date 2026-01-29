@@ -91,9 +91,11 @@ export class CerebrasService {
           goals?: string;
           preferences?: string;
           location?: string;
+          address?: string;
         };
         const parts: string[] = [];
         if (profile.name) parts.push(`Name: ${profile.name}`);
+        if (profile.address) parts.push(`Address: ${profile.address}`);
         if (profile.location) parts.push(`Location: ${profile.location}`);
         if (profile.role) parts.push(`Role: ${profile.role}`);
         if (profile.goals) parts.push(`Goals: ${profile.goals}`);

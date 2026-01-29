@@ -801,6 +801,15 @@
   pointer-events: none;
 }
 
+.chat-preview-message--interactive .chat-preview-content {
+  cursor: default;
+  border-color: var(--accent-primary);
+}
+
+.chat-preview-message--interactive .chat-preview-content webview {
+  pointer-events: auto;
+}
+
 .chat-preview-stage {
   position: absolute;
   top: 0;
